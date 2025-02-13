@@ -6,24 +6,34 @@ import pytest
 
 # syft absolute
 from syft.__init__ import __version__
-from syft.abstract_node import NodeSideType
-from syft.abstract_node import NodeType
-from syft.service.metadata.node_metadata import NodeMetadataJSON
-from syft.service.settings.settings import NodeSettings
-from syft.service.settings.settings import NodeSettingsUpdate
+from syft.abstract_server import ServerSideType
+from syft.abstract_server import ServerType
+from syft.server.credentials import SyftSigningKey
+from syft.service.metadata.server_metadata import ServerMetadataJSON
+from syft.service.notifier.notifier_stash import NotifierStash
+from syft.service.settings.settings import ServerSettings
+from syft.service.settings.settings import ServerSettingsUpdate
 from syft.service.settings.settings_service import SettingsService
 from syft.service.settings.settings_stash import SettingsStash
-from syft.types.syft_object import SYFT_OBJECT_VERSION_1
+from syft.types.syft_object import HIGHEST_SYFT_OBJECT_VERSION
+from syft.types.syft_object import LOWEST_SYFT_OBJECT_VERSION
+from syft.types.uid import UID
+
+
+@pytest.fixture
+def notifier_stash(document_store) -> NotifierStash:
+    yield NotifierStash(store=document_store)
 
 
 @pytest.fixture
 def settings_stash(document_store) -> SettingsStash:
-    return SettingsStash(store=document_store)
+    yield SettingsStash(store=document_store)
 
 
 @pytest.fixture
-def settings(worker, faker) -> NodeSettings:
-    return NodeSettings(
+def settings(worker, faker) -> ServerSettings:
+    yield ServerSettings(
+        id=UID(),
         name=worker.name,
         organization=faker.text(),
         on_board=faker.boolean(),
@@ -31,14 +41,19 @@ def settings(worker, faker) -> NodeSettings:
         deployed_on=datetime.now().date().strftime("%m/%d/%Y"),
         signup_enabled=False,
         admin_email="info@openmined.org",
-        node_side_type=NodeSideType.LOW_SIDE,
+        server_side_type=ServerSideType.LOW_SIDE,
         show_warnings=False,
+        verify_key=SyftSigningKey.generate().verify_key,
+        server_type=ServerType.DATASITE,
+        association_request_auto_approval=False,
+        default_worker_pool="default-pool",
+        notifications_enabled=False,
     )
 
 
 @pytest.fixture
-def update_settings(faker) -> NodeSettingsUpdate:
-    return NodeSettingsUpdate(
+def update_settings(faker) -> ServerSettingsUpdate:
+    yield ServerSettingsUpdate(
         name=faker.name(),
         description=faker.text(),
         on_board=faker.boolean(),
@@ -46,23 +61,22 @@ def update_settings(faker) -> NodeSettingsUpdate:
 
 
 @pytest.fixture
-def metadata_json(faker) -> NodeMetadataJSON:
-    return NodeMetadataJSON(
+def metadata_json(faker) -> ServerMetadataJSON:
+    yield ServerMetadataJSON(
         metadata_version=faker.random_int(),
         name=faker.name(),
         id=faker.text(),
         verify_key=faker.text(),
-        highest_version=SYFT_OBJECT_VERSION_1,
-        lowest_version=SYFT_OBJECT_VERSION_1,
+        highest_object_version=HIGHEST_SYFT_OBJECT_VERSION,
+        lowest_object_version=LOWEST_SYFT_OBJECT_VERSION,
         syft_version=__version__,
-        signup_enabled=False,
-        admin_email="info@openmined.org",
-        node_side_type=NodeSideType.LOW_SIDE.value,
+        server_side_type=ServerSideType.LOW_SIDE.value,
         show_warnings=False,
-        node_type=NodeType.DOMAIN.value,
+        server_type=ServerType.DATASITE.value,
+        min_size_blob_storage_mb=1,
     )
 
 
 @pytest.fixture
 def settings_service(document_store) -> SettingsService:
-    return SettingsService(store=document_store)
+    yield SettingsService(store=document_store)

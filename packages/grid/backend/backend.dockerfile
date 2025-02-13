@@ -1,65 +1,93 @@
-ARG PYTHON_VERSION='3.11'
+ARG PYTHON_VERSION="3.12"
+ARG UV_VERSION="0.2.13-r0"
+ARG TORCH_VERSION="2.2.2"
 
-FROM python:3.11-slim as build
+# wolfi-os pkg definition links
+# https://github.com/wolfi-dev/os/blob/main/python-3.12.yaml
+# https://github.com/wolfi-dev/os/blob/main/py3-pip.yaml
+# https://github.com/wolfi-dev/os/blob/main/uv.yaml
 
-# set UTC timezone
-ENV TZ=Etc/UTC
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+# ==================== [BUILD STEP] Python Dev Base ==================== #
 
-RUN mkdir -p /root/.local
+FROM cgr.dev/chainguard/wolfi-base AS syft_deps
 
-RUN apt-get update && apt-get upgrade -y
-RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
-    DEBIAN_FRONTEND=noninteractive \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-    curl python3-dev gcc make build-essential cmake git
+ARG PYTHON_VERSION
+ARG UV_VERSION
+ARG TORCH_VERSION
 
-RUN --mount=type=cache,target=/root/.cache \
-    pip install -U pip
+# Setup Python DEV
+RUN apk update && apk upgrade && \
+    apk add build-base gcc python-$PYTHON_VERSION-dev uv=$UV_VERSION && \
+    # preemptive fix for wolfi-os breaking python entrypoint
+    (test -f /usr/bin/python || ln -s /usr/bin/python3.12 /usr/bin/python)
 
-#install jupyterlab
-RUN --mount=type=cache,target=/root/.cache \
-    pip install --user jupyterlab
+WORKDIR /root/app
 
-WORKDIR /app
+ENV UV_HTTP_TIMEOUT=600
 
-# Backend
-FROM python:$PYTHON_VERSION-slim as backend
-RUN apt-get update && apt-get upgrade -y
-COPY --from=build /root/.local /root/.local
+# keep static deps separate to have each layer cached independently
+# if amd64 then we need to append +cpu to the torch version
+# uv issues: https://github.com/astral-sh/uv/issues/3437 & https://github.com/astral-sh/uv/issues/2541
+RUN --mount=type=cache,target=/root/.cache,sharing=locked \
+    uv venv && \
+    ARCH=$(arch | sed s/aarch64/arm64/ | sed s/x86_64/amd64/) && \
+    if [[ "$ARCH" = "amd64" ]]; then TORCH_VERSION="$TORCH_VERSION+cpu"; fi && \
+    uv pip install torch==$TORCH_VERSION --index-url https://download.pytorch.org/whl/cpu
 
-ENV PYTHONPATH=/app
-ENV PATH=/root/.local/bin:$PATH
+COPY syft/setup.py syft/setup.cfg syft/pyproject.toml ./syft/
 
-RUN --mount=type=cache,target=/root/.cache \
-    pip install -U pip
+COPY syft/src/syft/VERSION ./syft/src/syft/
 
-WORKDIR /app
+RUN --mount=type=cache,target=/root/.cache,sharing=locked \
+    # remove torch because we already have the cpu version pre-installed
+    sed --in-place /torch==/d ./syft/setup.cfg && \
+    uv pip install -e ./syft[data_science,telemetry]
 
-# copy grid
-COPY grid/backend /app/
+# ==================== [Final] Setup Syft Server ==================== #
 
-# copy skeleton to do package install
-COPY syft/setup.py /app/syft/setup.py
-COPY syft/setup.cfg /app/syft/setup.cfg
-COPY syft/pyproject.toml /app/syft/pyproject.toml
-COPY syft/MANIFEST.in /app/syft/MANIFEST.in
-COPY syft/src/syft/VERSION /app/syft/src/syft/VERSION
-COPY syft/src/syft/capnp /app/syft/src/syft/capnp
+FROM cgr.dev/chainguard/wolfi-base AS backend
 
-# install syft
-RUN --mount=type=cache,target=/root/.cache \
-    pip install --user -e /app/syft && \
-    pip uninstall ansible ansible-core -y && \
-    rm -rf ~/.local/lib/python3.11/site-packages/ansible_collections
+ARG PYTHON_VERSION
+ARG UV_VERSION
 
-# security patches
-RUN apt purge --auto-remove linux-libc-dev -y || true
-RUN apt purge --auto-remove libldap-2.5-0 -y || true
+RUN apk update && apk upgrade && \
+    apk add --no-cache git bash python-$PYTHON_VERSION py$PYTHON_VERSION-pip uv=$UV_VERSION && \
+    # preemptive fix for wolfi-os breaking python entrypoint
+    (test -f /usr/bin/python || ln -s /usr/bin/python3.12 /usr/bin/python)
 
-# copy any changed source
-COPY syft/src /app/syft/src
+WORKDIR /root/app/
 
-# change to worker-start.sh or start-reload.sh as needed
-CMD ["bash", "/app/grid/start.sh"]
+# Copy pre-built syft dependencies
+COPY --from=syft_deps /root/app/.venv .venv
+
+# copy server
+COPY grid/backend/grid ./grid/
+
+# copy syft
+COPY syft ./syft/
+
+# Update environment variables
+ENV \
+    # "activate" venv
+    PATH="/root/app/.venv/bin/:$PATH" \
+    VIRTUAL_ENV="/root/app/.venv" \
+    # Syft
+    APPDIR="/root/app" \
+    SERVER_NAME="default_server_name" \
+    SERVER_TYPE="datasite" \
+    SERVER_SIDE_TYPE="high" \
+    RELEASE="production" \
+    DEV_MODE="False" \
+    DEBUGGER_ENABLED="False" \
+    TRACING="False" \
+    CONTAINER_HOST="docker" \
+    DEFAULT_ROOT_EMAIL="info@openmined.org" \
+    DEFAULT_ROOT_PASSWORD="changethis" \
+    STACK_API_KEY="changeme" \
+    POSTGRESQL_DBNAME="syftdb_postgres" \
+    POSTGRESQL_HOST="localhost" \
+    POSTGRESQL_PORT="5432" \
+    POSTGRESQL_USERNAME="syft_postgres" \
+    POSTGRESQL_PASSWORD="example"
+
+CMD ["bash", "./grid/start.sh"]

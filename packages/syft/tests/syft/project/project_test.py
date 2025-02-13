@@ -17,13 +17,13 @@ def test_project_creation(worker):
         password_verify="bazinga",
     )
 
-    ds_client = sy.login(node=worker, email="sheldon@caltech.edu", password="bazinga")
+    ds_client = sy.login(server=worker, email="sheldon@caltech.edu", password="bazinga")
 
     new_project = sy.Project(
         name="My Cool Project", description="My Cool Description", members=[ds_client]
     )
 
-    project = new_project.start()
+    project = new_project.send()
 
     assert isinstance(project, Project)
     assert new_project.id == project.id
@@ -33,7 +33,7 @@ def test_project_creation(worker):
     assert project.description == "My Cool Description"
 
 
-def test_error_data_owner_project_creation(worker):
+def test_data_owner_project_creation(worker):
     root_client = worker.root_client
 
     root_client.register(
@@ -47,10 +47,8 @@ def test_error_data_owner_project_creation(worker):
         name="My Cool Project", description="My Cool Description", members=[root_client]
     )
 
-    project = new_project.start()
-
-    assert isinstance(project, sy.SyftError)
-    assert project.message == "Only Data Scientists can create projects"
+    project = new_project.send()
+    assert project.name == "My Cool Project"
 
 
 def test_exception_different_email(worker):
@@ -70,9 +68,13 @@ def test_exception_different_email(worker):
         password_verify="penny",
     )
 
-    ds_sheldon = sy.login(node=worker, email="sheldon@caltech.edu", password="bazinga")
+    ds_sheldon = sy.login(
+        server=worker, email="sheldon@caltech.edu", password="bazinga"
+    )
 
-    ds_leonard = sy.login(node=worker, email="leonard@princeton.edu", password="penny")
+    ds_leonard = sy.login(
+        server=worker, email="leonard@princeton.edu", password="penny"
+    )
 
     with pytest.raises(ValidationError):
         sy.Project(
@@ -92,11 +94,15 @@ def test_project_serde(worker):
         password_verify="bazinga",
     )
 
-    new_project = sy.Project(
-        name="My Cool Project", description="My Cool Description", members=[root_client]
+    ds_sheldon = sy.login(
+        server=worker, email="sheldon@caltech.edu", password="bazinga"
     )
 
-    project = new_project.start()
+    new_project = sy.Project(
+        name="My Cool Project", description="My Cool Description", members=[ds_sheldon]
+    )
+
+    project = new_project.send()
 
     ser_data = sy.serialize(project, to_bytes=True)
     assert isinstance(ser_data, bytes)

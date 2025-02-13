@@ -1,12 +1,10 @@
 # stdlib
+from collections.abc import Callable
 from enum import Enum
 import inspect
 import math
 import sys
 from typing import Any
-from typing import Callable
-from typing import Tuple
-from typing import Type
 
 # third party
 import numpy as np
@@ -22,22 +20,24 @@ from syft.service.action.action_object import HOOK_ALWAYS
 from syft.service.action.action_object import HOOK_ON_POINTERS
 from syft.service.action.action_object import PreHookContext
 from syft.service.action.action_object import make_action_side_effect
-from syft.service.action.action_object import propagate_node_uid
+from syft.service.action.action_object import propagate_server_uid
 from syft.service.action.action_object import send_action_side_effect
 from syft.service.action.action_types import action_type_for_type
+from syft.service.response import SyftSuccess
+from syft.store.blob_storage import SyftObjectRetrieval
+from syft.types.errors import SyftException
+from syft.types.uid import LineageID
+from syft.types.uid import UID
 
 
 def helper_make_action_obj(orig_obj: Any):
-    obj_id = Action.make_id(None)
-    lin_obj_id = Action.make_result_id(obj_id)
-
-    return ActionObject.from_obj(orig_obj, id=obj_id, syft_lineage_id=lin_obj_id)
+    return ActionObject.from_obj(orig_obj)
 
 
 def helper_make_action_pointers(worker, obj, *args, **kwargs):
-    root_domain_client = worker.root_client
-    root_domain_client.api.services.action.set(obj)
-    obj_pointer = root_domain_client.api.services.action.get_pointer(obj.id)
+    root_datasite_client = worker.root_client
+    res = obj.send(root_datasite_client)
+    obj_pointer = root_datasite_client.api.services.action.get_pointer(res.id)
 
     # The args and kwargs should automatically be pointerized by obj_pointer
     return obj_pointer, args, kwargs
@@ -59,18 +59,16 @@ def helper_make_action_pointers(worker, obj, *args, **kwargs):
         ("set", "add"),
     ],
 )
-def test_action_sanity(path_op: Tuple[str, str]):
+def test_action_sanity(path_op: tuple[str, str]):
     path, op = path_op
 
-    remote_self = Action.make_result_id(None)
-    result_id = Action.make_result_id(None)
+    remote_self = LineageID()
     new_action = Action(
         path=path,
         op=op,
         remote_self=remote_self,
         args=[],
         kwargs={},
-        result_id=result_id,
     )
     assert new_action is not None
     assert new_action.full_path == f"{path}.{op}"
@@ -99,29 +97,29 @@ def test_actionobject_from_obj_sanity(orig_obj: Any):
     assert obj.syft_history_hash is not None
 
     # with id
-    obj_id = Action.make_id(None)
+    obj_id = UID()
     obj = ActionObject.from_obj(orig_obj, id=obj_id)
     assert obj.id == obj_id
     assert obj.syft_history_hash == hash(obj_id)
 
     # with id and lineage id
-    obj_id = Action.make_id(None)
-    lin_obj_id = Action.make_result_id(obj_id)
+    obj_id = UID()
+    lin_obj_id = LineageID(obj_id)
     obj = ActionObject.from_obj(orig_obj, id=obj_id, syft_lineage_id=lin_obj_id)
     assert obj.id == obj_id
     assert obj.syft_history_hash == lin_obj_id.syft_history_hash
 
 
 def test_actionobject_from_obj_fail_id_mismatch():
-    obj_id = Action.make_id(None)
-    lineage_id = Action.make_result_id(None)
+    obj_id = UID()
+    lineage_id = LineageID()
 
     with pytest.raises(ValueError):
         ActionObject.from_obj("abc", id=obj_id, syft_lineage_id=lineage_id)
 
 
 @pytest.mark.parametrize("dtype", [int, float, str, Any, bool, dict, set, tuple, list])
-def test_actionobject_make_empty_sanity(dtype: Type):
+def test_actionobject_make_empty_sanity(dtype: type):
     syft_type = action_type_for_type(dtype)
 
     obj = ActionObject.empty(
@@ -131,14 +129,14 @@ def test_actionobject_make_empty_sanity(dtype: Type):
     assert obj.syft_history_hash is not None
 
     # with id
-    obj_id = Action.make_id(None)
+    obj_id = UID()
     obj = ActionObject.empty(syft_internal_type=syft_type, id=obj_id)
     assert obj.id == obj_id
     assert obj.syft_history_hash == hash(obj_id)
 
     # with id and lineage id
-    obj_id = Action.make_id(None)
-    lin_obj_id = Action.make_result_id(obj_id)
+    obj_id = UID()
+    lin_obj_id = LineageID(obj_id)
     obj = ActionObject.empty(
         syft_internal_type=syft_type, id=obj_id, syft_lineage_id=lin_obj_id
     )
@@ -163,12 +161,29 @@ def test_actionobject_make_empty_sanity(dtype: Type):
 def test_actionobject_hooks_init(orig_obj: Any):
     obj = ActionObject.from_obj(orig_obj)
 
-    assert HOOK_ALWAYS in obj._syft_pre_hooks__
-    assert HOOK_ALWAYS in obj._syft_post_hooks__
+    assert HOOK_ALWAYS in obj.syft_pre_hooks__
+    assert HOOK_ALWAYS in obj.syft_post_hooks__
+    assert HOOK_ON_POINTERS in obj.syft_pre_hooks__
+    assert HOOK_ON_POINTERS in obj.syft_post_hooks__
 
-    assert make_action_side_effect in obj._syft_pre_hooks__[HOOK_ALWAYS]
-    assert send_action_side_effect in obj._syft_pre_hooks__[HOOK_ON_POINTERS]
-    assert propagate_node_uid in obj._syft_post_hooks__[HOOK_ALWAYS]
+    assert make_action_side_effect in obj.syft_pre_hooks__[HOOK_ALWAYS]
+
+
+def test_actionobject_add_pre_hooks():
+    # Eager execution is disabled by default
+    obj = ActionObject.from_obj(1)
+
+    assert make_action_side_effect in obj.syft_pre_hooks__[HOOK_ALWAYS]
+    assert send_action_side_effect not in obj.syft_pre_hooks__[HOOK_ON_POINTERS]
+    assert propagate_server_uid not in obj.syft_post_hooks__[HOOK_ALWAYS]
+
+    # eager exec tests:
+    obj._syft_add_pre_hooks__(eager_execution=True)
+    obj._syft_add_post_hooks__(eager_execution=True)
+
+    assert make_action_side_effect in obj.syft_pre_hooks__[HOOK_ALWAYS]
+    assert send_action_side_effect in obj.syft_pre_hooks__[HOOK_ON_POINTERS]
+    assert propagate_server_uid in obj.syft_post_hooks__[HOOK_ALWAYS]
 
 
 @pytest.mark.parametrize(
@@ -193,10 +208,7 @@ def test_actionobject_hooks_make_action_side_effect(orig_obj_op: Any):
     obj = ActionObject.from_obj(orig_obj)
 
     context = PreHookContext(obj=obj, op_name=op)
-    result = make_action_side_effect(context)
-    assert result.is_ok()
-
-    context, args, kwargs = result.ok()
+    context, args, kwargs = make_action_side_effect(context).unwrap()
     assert context.action is not None
     assert isinstance(context.action, Action)
     assert context.action.full_path.endswith("." + op)
@@ -239,12 +251,12 @@ def test_actionobject_hooks_send_action_side_effect_err_invalid_args(worker):
     ],
 )
 def test_actionobject_hooks_send_action_side_effect_ignore_op(
-    root_domain_client, orig_obj_op
+    root_datasite_client, orig_obj_op
 ):
     orig_obj, op, args, kwargs = orig_obj_op
 
     obj = helper_make_action_obj(orig_obj)
-    obj = obj.send(root_domain_client)
+    obj = obj.send(root_datasite_client)
 
     context = PreHookContext(obj=obj, op_name=op)
     result = send_action_side_effect(context, *args, **kwargs)
@@ -287,40 +299,40 @@ def test_actionobject_hooks_send_action_side_effect_ok(worker, orig_obj_op):
     assert context.result_id is not None
 
 
-def test_actionobject_hooks_propagate_node_uid_err():
+def test_actionobject_hooks_propagate_server_uid_err():
     orig_obj = "abc"
     op = "capitalize"
 
     obj = ActionObject.from_obj(orig_obj)
 
     context = PreHookContext(obj=obj, op_name=op)
-    result = propagate_node_uid(context, op=op, result="orig_obj")
+    result = propagate_server_uid(context, op=op, result="orig_obj")
     assert result.is_err()
 
 
-def test_actionobject_hooks_propagate_node_uid_ok():
+def test_actionobject_hooks_propagate_server_uid_ok():
     orig_obj = "abc"
     op = "capitalize"
 
-    obj_id = Action.make_id(None)
+    obj_id = UID()
     obj = ActionObject.from_obj(orig_obj)
 
     obj.syft_point_to(obj_id)
 
     context = PreHookContext(obj=obj, op_name=op)
-    result = propagate_node_uid(context, op=op, result="orig_obj")
+    result = propagate_server_uid(context, op=op, result="orig_obj")
     assert result.is_ok()
 
 
 def test_actionobject_syft_point_to():
     orig_obj = "abc"
 
-    obj_id = Action.make_id(None)
+    obj_id = UID()
     obj = ActionObject.from_obj(orig_obj)
 
     obj.syft_point_to(obj_id)
 
-    assert obj.syft_node_uid == obj_id
+    assert obj.syft_server_uid == obj_id
 
 
 @pytest.mark.parametrize(
@@ -347,8 +359,9 @@ def test_actionobject_syft_execute_ok(worker, testcase):
     )
 
     context = PreHookContext(obj=obj_pointer, op_name=op, action_type=ActionType.METHOD)
-    result = make_action_side_effect(context, *args_pointers, **kwargs_pointers)
-    context, _, _ = result.ok()
+    context, _, _ = make_action_side_effect(
+        context, *args_pointers, **kwargs_pointers
+    ).unwrap()
 
     action_result = context.obj.syft_execute_action(context.action, sync=True)
     assert action_result == expected
@@ -491,17 +504,17 @@ def test_actionobject_syft_get_path(testcase):
     ],
 )
 def test_actionobject_syft_send_get(worker, testcase):
-    root_domain_client = worker.root_client
-    root_domain_client._fetch_api(root_domain_client.credentials)
-    action_store = worker.get_service("actionservice").store
+    root_datasite_client = worker.root_client
+    root_datasite_client._fetch_api(root_datasite_client.credentials)
+    action_store = worker.services.action.stash
 
     orig_obj = testcase
     obj = helper_make_action_obj(orig_obj)
 
-    assert len(action_store.data) == 0
+    assert len(action_store._data) == 0
 
-    ptr = obj.send(root_domain_client)
-    assert len(action_store.data) == 1
+    ptr = obj.send(root_datasite_client)
+    assert len(action_store._data) == 1
     retrieved = ptr.get()
 
     assert obj.syft_action_data == retrieved
@@ -569,8 +582,11 @@ def test_actionobject_syft_get_attr_context():
         (complex(1, 2), "conjugate", [], {}, complex(1, -2)),
     ],
 )
+@pytest.mark.skip(reason="Disabled until we bring back eager execution")
 def test_actionobject_syft_execute_hooks(worker, testcase):
     client = worker.root_client
+    assert client.settings.enable_eager_execution(enable=True)
+
     orig_obj, op, args, kwargs, expected = testcase
 
     obj = helper_make_action_obj(orig_obj)
@@ -587,9 +603,9 @@ def test_actionobject_syft_execute_hooks(worker, testcase):
     )
     assert context.result_id is not None
 
-    context.obj.syft_node_uid = Action.make_id(None)
+    context.obj.syft_server_uid = UID()
     result = obj_pointer._syft_run_post_hooks__(context, name=op, result=obj_pointer)
-    assert result.syft_node_uid == context.obj.syft_node_uid
+    assert result.syft_server_uid == context.obj.syft_server_uid
 
 
 @pytest.mark.parametrize(
@@ -642,7 +658,7 @@ def test_actionobject_syft_wrap_attribute_for_properties(orig_obj):
             assert prop is not None
             assert isinstance(prop, ActionObject)
             assert hasattr(prop, "id")
-            assert hasattr(prop, "syft_node_uid")
+            assert hasattr(prop, "syft_server_uid")
             assert hasattr(prop, "syft_history_hash")
 
 
@@ -923,7 +939,7 @@ def test_actionobject_syft_getattr_int(orig_obj: int, worker, scenario):
         assert (3 >> obj) == (3 >> orig_obj)
 
 
-def test_actionobject_syft_getattr_int_history(worker):
+def test_actionobject_syft_getattr_int_history():
     orig_obj = 5
     obj1 = ActionObject.from_obj(orig_obj)
     obj2 = ActionObject.from_obj(orig_obj)
@@ -985,7 +1001,7 @@ def test_actionobject_syft_getattr_float_history():
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux",
+    sys.platform == "win32",
     reason="This is a hackish way to test attribute set/get, and it might fail on Windows or OSX",
 )
 def test_actionobject_syft_getattr_np(worker):
@@ -1009,3 +1025,35 @@ def test_actionobject_syft_getattr_pandas(worker):
 
     obj.columns = ["a", "b", "c"]
     assert (obj.columns == ["a", "b", "c"]).all()
+
+
+def test_actionobject_delete(worker):
+    """
+    Test deleting action objects and their corresponding blob storage entries
+    """
+    root_client = worker.root_client
+
+    # small object with no blob store entry
+    data_small = np.random.randint(0, 100, size=3)
+    action_obj = ActionObject.from_obj(data_small)
+    action_obj.send(root_client)
+    assert action_obj.syft_blob_storage_entry_id is None
+    del_res = root_client.api.services.action.delete(uid=action_obj.id)
+    assert isinstance(del_res, SyftSuccess)
+
+    # big object with blob store entry
+    num_elements = 25 * 1024 * 1024
+    data_big = np.random.randint(0, 100, size=num_elements)  # 4 bytes per int32
+    action_obj_2 = ActionObject.from_obj(data_big)
+    action_obj_2.send(root_client)
+    assert isinstance(action_obj_2.syft_blob_storage_entry_id, UID)
+    read_res = root_client.api.services.blob_storage.read(
+        action_obj_2.syft_blob_storage_entry_id
+    )
+    assert isinstance(read_res, SyftObjectRetrieval)
+    del_res = root_client.api.services.action.delete(uid=action_obj_2.id)
+    assert isinstance(del_res, SyftSuccess)
+    with pytest.raises(SyftException):
+        read_res = root_client.api.services.blob_storage.read(
+            action_obj_2.syft_blob_storage_entry_id
+        )

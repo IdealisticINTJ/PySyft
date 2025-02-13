@@ -27,17 +27,6 @@ backend:
   - packages/grid/backend/**/*.sh
   - packages/grid/backend/**/*.mako
 
-hagrid:
-  - .github/workflows/pr-tests-hagrid.yml
-  - packages/hagrid/**/*.py
-  - packages/hagrid/**/*.cfg
-  - packages/hagrid/**/*.yml
-  - packages/hagrid/**/*.dockerfile
-  - packages/hagrid/**/*.toml
-  - packages/hagrid/**/*.txt
-  - packages/hagrid/**/*.ini
-  - packages/hagrid/**/*.sh
-
 syft:
   - .github/workflows/pr-tests-syft.yml
   - packages/syft/**/*.py
@@ -77,6 +66,20 @@ notebooks:
   - .github/workflows/pr-tests-syft.yml
   - notebooks/api/**/*.ipynb
   - notebooks/tutorials/**/*.ipynb
+  - packages/syft/**/*.py
+  - packages/syft/**/*.capnp
+  - packages/syft/**/*.yml
+  - packages/syft/**/*.cfg
+  - packages/syft/**/*.dockerfile
+  - packages/syft/**/*.toml
+  - packages/syft/**/*.txt
+  - packages/syft/**/*.ini
+  - packages/syft/**/*.sh
+  - packages/syft/**/*.mako
+
+notebooks_scenario:
+  - .github/workflows/pr-tests-syft.yml
+  - notebooks/scenarios/**/*.ipynb
   - packages/syft/**/*.py
   - packages/syft/**/*.capnp
   - packages/syft/**/*.yml

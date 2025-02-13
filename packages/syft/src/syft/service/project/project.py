@@ -2,38 +2,32 @@
 from __future__ import annotations
 
 # stdlib
+from collections.abc import Callable
+from collections.abc import Iterable
 import copy
 import hashlib
 import textwrap
 import time
 from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import Iterable
-from typing import List
-from typing import Optional
-from typing import Set
-from typing import Tuple
-from typing import Type
-from typing import Union
 
 # third party
-import pydantic
-from pydantic import validator
+from pydantic import Field
+from pydantic import field_validator
 from rich.progress import Progress
 from typing_extensions import Self
 
 # relative
-from ...client.api import NodeIdentity
+from ...client.api import ServerIdentity
 from ...client.client import SyftClient
 from ...client.client import SyftClientSessionCache
-from ...node.credentials import SyftSigningKey
-from ...node.credentials import SyftVerifyKey
 from ...serde.serializable import serializable
 from ...serde.serialize import _serialize
-from ...service.metadata.node_metadata import NodeMetadata
+from ...server.credentials import SyftSigningKey
+from ...server.credentials import SyftVerifyKey
+from ...service.metadata.server_metadata import ServerMetadata
 from ...store.linked_obj import LinkedObject
 from ...types.datetime import DateTime
+from ...types.errors import SyftException
 from ...types.identity import Identity
 from ...types.identity import UserIdentity
 from ...types.syft_object import SYFT_OBJECT_VERSION_1
@@ -43,32 +37,32 @@ from ...types.transforms import TransformContext
 from ...types.transforms import rename
 from ...types.transforms import transform
 from ...types.uid import UID
-from ...util import options
-from ...util.colors import SURFACE
+from ...util.decorators import deprecated
 from ...util.markdown import markdown_as_class_with_fields
 from ...util.util import full_name_with_qualname
 from ..code.user_code import SubmitUserCode
-from ..network.network_service import NodePeer
-from ..network.routes import NodeRoute
+from ..network.network_service import ServerPeer
+from ..network.routes import ServerRoute
 from ..network.routes import connection_to_route
 from ..request.request import Request
 from ..request.request import RequestStatus
-from ..response import SyftError
-from ..response import SyftException
+from ..response import SyftInfo
 from ..response import SyftNotReady
 from ..response import SyftSuccess
+from ..user.user import UserView
 
 
-@serializable()
+@serializable(canonical_name="EventAlreadyAddedException", version=1)
 class EventAlreadyAddedException(SyftException):
     pass
 
 
-@transform(NodeMetadata, NodeIdentity)
-def metadata_to_node_identity() -> List[Callable]:
-    return [rename("id", "node_id"), rename("name", "node_name")]
+@transform(ServerMetadata, ServerIdentity)
+def metadata_to_server_identity() -> list[Callable]:
+    return [rename("id", "server_id"), rename("name", "server_name")]
 
 
+@serializable()
 class ProjectEvent(SyftObject):
     __canonical_name__ = "ProjectEvent"
     __version__ = SYFT_OBJECT_VERSION_1
@@ -77,29 +71,23 @@ class ProjectEvent(SyftObject):
 
     # 1. Creation attrs
     id: UID
-    timestamp: DateTime
-    allowed_sub_types: Optional[List] = []
+    timestamp: DateTime = Field(default_factory=DateTime.now)
+    allowed_sub_types: list | None = []
     # 2. Rebase attrs
-    project_id: Optional[UID]
-    seq_no: Optional[int]
-    prev_event_uid: Optional[UID]
-    prev_event_hash: Optional[str]
-    event_hash: Optional[str]
+    project_id: UID | None = None
+    seq_no: int | None = None
+    prev_event_uid: UID | None = None
+    prev_event_hash: str | None = None
+    event_hash: str | None = None
     # 3. Signature attrs
-    creator_verify_key: Optional[SyftVerifyKey]
-    signature: Optional[bytes]  # dont use in signing
+    creator_verify_key: SyftVerifyKey | None = None
+    signature: bytes | None = None  # dont use in signing
 
-    def __repr_syft_nested__(self):
+    def __repr_syft_nested__(self) -> tuple[str, str]:
         return (
             short_qual_name(full_name_with_qualname(self)),
             f"{str(self.id)[:4]}...{str(self.id)[-3:]}",
         )
-
-    @pydantic.root_validator(pre=True)
-    def make_timestamp(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        if "timestamp" not in values or values["timestamp"] is None:
-            values["timestamp"] = DateTime.now()
-        return values
 
     def _pre_add_update(self, project: Project) -> None:
         pass
@@ -108,7 +96,7 @@ class ProjectEvent(SyftObject):
         prev_event = project.events[-1] if project.events else None
         self.project_id = project.id
 
-        if prev_event:
+        if prev_event and prev_event.seq_no is not None:
             self.prev_event_uid = prev_event.id
             self.prev_event_hash = prev_event.event_hash
             self.seq_no = prev_event.seq_no + 1
@@ -120,31 +108,34 @@ class ProjectEvent(SyftObject):
         return self
 
     @property
-    def valid(self) -> Union[SyftSuccess, SyftError]:
+    def valid(self) -> SyftSuccess:
         if self.signature is None:
-            return SyftError(message="Sign event first")
+            raise SyftException(public_message="Sign event first")
         try:
             # Recompute hash
             event_hash_bytes, current_hash = create_project_event_hash(self)
             if current_hash != self.event_hash:
-                raise Exception(
-                    f"Event hash {current_hash} does not match {self.event_hash}"
+                raise SyftException(
+                    public_message=f"Event hash {current_hash} does not match {self.event_hash}"
                 )
-
+            if self.creator_verify_key is None:
+                raise SyftException(
+                    public_message=f"{self}'s creator_verify_key is None"
+                )
             self.creator_verify_key.verify_key.verify(event_hash_bytes, self.signature)
             return SyftSuccess(message="Event signature is valid")
         except Exception as e:
-            return SyftError(message=f"Failed to validate message. {e}")
+            raise SyftException(public_message=f"Failed to validate message. {e}")
 
     def valid_descendant(
-        self, project: Project, prev_event: Optional[Self]
-    ) -> Union[SyftSuccess, SyftError]:
+        self, project: Project, prev_event: Self | None
+    ) -> SyftSuccess:
         valid = self.valid
         if not valid:
             return valid
 
         if prev_event:
-            prev_event_id = prev_event.id
+            prev_event_id: UID | None = prev_event.id
             prev_event_hash = prev_event.event_hash
             prev_seq_no = prev_event.seq_no
         else:
@@ -153,34 +144,42 @@ class ProjectEvent(SyftObject):
             prev_seq_no = 0
 
         if self.prev_event_uid != prev_event_id:
-            return SyftError(
-                message=f"{self} prev_event_uid: {self.prev_event_uid} "
+            raise SyftException(
+                public_message=f"{self} prev_event_uid: {self.prev_event_uid} "
                 "does not match {prev_event_id}"
             )
 
         if self.prev_event_hash != prev_event_hash:
-            return SyftError(
-                message=f"{self} prev_event_hash: {self.prev_event_hash} "
+            raise SyftException(
+                public_message=f"{self} prev_event_hash: {self.prev_event_hash} "
                 "does not match {prev_event_hash}"
             )
 
-        if self.seq_no != prev_seq_no + 1:
-            return SyftError(
-                message=f"{self} seq_no: {self.seq_no} "
+        if (
+            (prev_seq_no is not None)
+            and (self.seq_no is not None)
+            and (self.seq_no != prev_seq_no + 1)
+        ):
+            raise SyftException(
+                public_message=f"{self} seq_no: {self.seq_no} "
                 "is not subsequent to {prev_seq_no}"
             )
 
         if self.project_id != project.id:
-            return SyftError(
-                message=f"{self} project_id: {self.project_id} "
+            raise SyftException(
+                public_message=f"{self} project_id: {self.project_id} "
                 "does not match {project.id}"
             )
 
         if hasattr(self, "parent_event_id"):
             parent_event = project.event_id_hashmap[self.parent_event_id]
-            if type(self) not in parent_event.allowed_sub_types:
-                return SyftError(
-                    message=f"{self} is not a valid subevent" f"for {parent_event}"
+            if (
+                parent_event.allowed_sub_types is not None
+                and type(self) not in parent_event.allowed_sub_types
+            ):
+                raise SyftException(
+                    public_message=f"{self} is not a valid subevent"
+                    f"for {parent_event}"
                 )
         return SyftSuccess(message=f"{self} is valid descendant of {prev_event}")
 
@@ -198,7 +197,7 @@ class ProjectEvent(SyftObject):
         signed_obj = signing_key.signing_key.sign(event_hash_bytes)
         self.signature = signed_obj._signature
 
-    def publish(self, project: Project) -> Union[SyftSuccess, SyftError]:
+    def publish(self, project: Project) -> SyftSuccess:
         try:
             result = project.add_event(self)
             return result
@@ -246,7 +245,7 @@ class ProjectMessage(ProjectEventAddObject):
     __version__ = SYFT_OBJECT_VERSION_1
 
     message: str
-    allowed_sub_types: List[Type] = [ProjectThreadMessage]
+    allowed_sub_types: list[type] = [ProjectThreadMessage]
 
     def reply(self, message: str) -> ProjectMessage:
         return ProjectThreadMessage(message=message, parent_event_id=self.id)
@@ -266,12 +265,14 @@ class ProjectRequest(ProjectEventAddObject):
     __version__ = SYFT_OBJECT_VERSION_1
 
     linked_request: LinkedObject
-    allowed_sub_types: List[Type] = [ProjectRequestResponse]
+    allowed_sub_types: list[type] = [ProjectRequestResponse]
 
-    @validator("linked_request", pre=True)
-    def _validate_linked_request(cls, v):
+    @field_validator("linked_request", mode="before")
+    @classmethod
+    def _validate_linked_request(cls, v: Any) -> LinkedObject:
         if isinstance(v, Request):
-            linked_request = LinkedObject.from_obj(v, node_uid=v.node_uid)
+            linked_request = LinkedObject.from_obj(v, server_uid=v.server_uid)
+            linked_request.syft_server_location = v.syft_server_location
             return linked_request
         elif isinstance(v, LinkedObject):
             return v
@@ -281,53 +282,54 @@ class ProjectRequest(ProjectEventAddObject):
             )
 
     @property
-    def request(self):
+    def request(self) -> Request:
         return self.linked_request.resolve
 
     __repr_attrs__ = [
         "request.status",
-        "request.changes[-1].link.service_func_name",
+        "request.changes[-1].code.service_func_name",
     ]
 
-    def _repr_markdown_(self) -> str:
+    def _repr_markdown_(self, wrap_as_python: bool = True, indent: int = 0) -> str:
         func_name = None
         if len(self.request.changes) > 0:
-            func_name = self.request.changes[-1].link.service_func_name
+            func_name = self.request.changes[-1].code.service_func_name
         repr_dict = {
             "request.status": self.request.status,
-            "request.changes[-1].link.service_func_name": func_name,
+            "request.changes[-1].code.service_func_name": func_name,
         }
         return markdown_as_class_with_fields(self, repr_dict)
 
     def approve(self) -> ProjectRequestResponse:
-        result = self.request.approve()
-        if isinstance(result, SyftError):
-            return result
+        self.request.approve().unwrap()
         return ProjectRequestResponse(response=True, parent_event_id=self.id)
 
-    def accept_by_depositing_result(self, result: Any, force: bool = False):
+    def accept_by_depositing_result(
+        self, result: Any, force: bool = False
+    ) -> SyftSuccess:
         return self.request.accept_by_depositing_result(result=result, force=force)
 
     # TODO: To add deny requests, when deny functionality is added
 
-    def status(self, project: Project) -> Union[Dict, SyftError]:
-        """Returns the status of the request
+    def status(self, project: Project) -> SyftInfo | None:
+        """Returns the status of the request.
 
         Args:
             project (Project): Project object to check the status
 
         Returns:
-            str: Status of the request
+            str: Status of the request.
 
         During Request  status calculation, we do not allow multiple responses
         """
-        responses = project.get_children(self)
+        responses: list[ProjectEvent] = project.get_children(self)
         if len(responses) == 0:
-            return "No one has responded to the request yet. Kindly recheck later 🙂"
-
-        if len(responses) > 1:
-            return SyftError(
-                message="The Request Contains more than one Response"
+            return SyftInfo(
+                "No one has responded to the request yet. Kindly recheck later 🙂"
+            )
+        elif len(responses) > 1:
+            raise SyftException(
+                public_message="The Request Contains more than one Response"
                 "which is currently not possible"
                 "The request should contain only one response"
                 "Kindly re-submit a new request"
@@ -335,14 +337,16 @@ class ProjectRequest(ProjectEventAddObject):
             )
         response = responses[0]
         if not isinstance(response, ProjectRequestResponse):
-            return SyftError(
-                message=f"Response : {type(response)} is not of type ProjectRequestResponse"
+            raise SyftException(  # type: ignore[unreachable]
+                public_message=f"Response : {type(response)} is not of type ProjectRequestResponse"
             )
 
         print("Request Status : ", "Approved" if response.response else "Denied")
 
+        return None
 
-def poll_creation_wizard() -> List[Any]:
+
+def poll_creation_wizard() -> tuple[str, list[str]]:
     w = textwrap.TextWrapper(initial_indent="\t", subsequent_indent="\t")
 
     welcome_msg = "Welcome to the Poll Creation Wizard 🧙‍♂️ 🪄!!!"
@@ -358,7 +362,7 @@ are given to select as their answer to the question.For example, a poll question
 Participants can then select the answer that best represents their opinion or preference"""
 
     description3 = """Since you didn't pass in questions, choices into .create_poll() (or you did so incorrectly),
-this wizard is going to guide you through the process of creating a poll."""
+this wizard is going to guide you through the process of creating a poll"""
 
     description4 = """In this wizard, we're going to ask you for a question and list of choices
 to create the poll. The Questions and choices are converted to strings"""
@@ -490,8 +494,8 @@ this wizard is going to guide you through the process of answering the poll."""
 
     print(w.fill(f"Question : {poll.question}"))
     print()
-    for idx, choice in enumerate(poll.choices):
-        print(w.fill(f"{idx+1}. {choice}"))
+    for idx, choice_i in enumerate(poll.choices):
+        print(w.fill(f"{idx+1}. {choice_i}"))
         print()
 
     print("\t" + "-" * 69)
@@ -501,7 +505,7 @@ this wizard is going to guide you through the process of answering the poll."""
     print()
     while True:
         try:
-            choice = int(input("\t"))
+            choice: int = int(input("\t"))
             if choice < 1 or choice > len(poll.choices):
                 raise ValueError()
         except ValueError:
@@ -517,7 +521,9 @@ this wizard is going to guide you through the process of answering the poll."""
 
     print("\t" + "=" * 69)
     print()
-    print(w.fill("All done! You have successfully completed the Poll Answer Wizard! 🎩"))
+    print(
+        w.fill("All done! You have successfully completed the Poll Answer Wizard! 🎩")
+    )
     print()
 
     return choice
@@ -537,11 +543,12 @@ class ProjectMultipleChoicePoll(ProjectEventAddObject):
     __version__ = SYFT_OBJECT_VERSION_1
 
     question: str
-    choices: List[str]
-    allowed_sub_types: List[Type] = [AnswerProjectPoll]
+    choices: list[str]
+    allowed_sub_types: list[type] = [AnswerProjectPoll]
 
-    @validator("choices")
-    def choices_min_length(cls, v):
+    @field_validator("choices")
+    @classmethod
+    def choices_min_length(cls, v: list[str]) -> list[str]:
         if len(v) < 1:
             raise ValueError("choices must have at least one item")
         return v
@@ -551,7 +558,7 @@ class ProjectMultipleChoicePoll(ProjectEventAddObject):
 
     def status(
         self, project: Project, pretty_print: bool = True
-    ) -> Union[Dict, SyftError]:
+    ) -> dict | SyftInfo | None:
         """Returns the status of the poll
 
         Args:
@@ -565,13 +572,13 @@ class ProjectMultipleChoicePoll(ProjectEventAddObject):
         """
         poll_answers = project.get_children(self)
         if len(poll_answers) == 0:
-            return "No one has answered this poll"
+            return SyftInfo(message="No one has answered this poll")
 
         respondents = {}
         for poll_answer in poll_answers[::-1]:
             if not isinstance(poll_answer, AnswerProjectPoll):
-                return SyftError(
-                    message=f"Poll answer: {type(poll_answer)} is not of type AnswerProjectPoll"
+                raise SyftException(  # type: ignore[unreachable]
+                    public_message=f"Poll answer: {type(poll_answer)} is not of type AnswerProjectPoll"
                 )
             creator_verify_key = poll_answer.creator_verify_key
 
@@ -585,6 +592,7 @@ class ProjectMultipleChoicePoll(ProjectEventAddObject):
             print("\nChoices:\n")
             for idx, choice in enumerate(self.choices):
                 print(f"{idx+1}: {choice}")
+            return None
         else:
             return respondents
 
@@ -593,7 +601,7 @@ class ConsensusModel:
     pass
 
 
-@serializable()
+@serializable(canonical_name="DemocraticConsensusModel", version=1)
 class DemocraticConsensusModel(ConsensusModel):
     threshold: float = 50
 
@@ -607,18 +615,19 @@ class DemocraticConsensusModel(ConsensusModel):
 
 
 def add_code_request_to_project(
-    project: Union[ProjectSubmit, Project],
+    project: ProjectSubmit | Project,
     code: SubmitUserCode,
-    client: SyftClient,
-    reason: Optional[str] = None,
-) -> Union[SyftError, SyftSuccess]:
+    client: SyftClient | Any,
+    reason: str | None = None,
+) -> SyftSuccess:
+    # TODO: fix the mypy issue
     if not isinstance(code, SubmitUserCode):
-        return SyftError(
-            message=f"Currently we are  only support creating requests for SubmitUserCode: {type(code)}"
+        raise SyftException(  # type: ignore[unreachable]
+            public_message=f"Currently we are only support creating requests for SubmitUserCode: {type(code)}"
         )
 
     if not isinstance(client, SyftClient):
-        return SyftError(message="Client should be a valid SyftClient")
+        raise SyftException(public_message="Client should be a valid SyftClient")
 
     if reason is None:
         reason = f"Code Request for Project: {project.name} has been submitted by {project.created_by}"
@@ -626,18 +635,16 @@ def add_code_request_to_project(
     submitted_req = client.api.services.code.request_code_execution(
         code=code, reason=reason
     )
-    if isinstance(submitted_req, SyftError):
-        return submitted_req
+    request_event = ProjectRequest(
+        linked_request=submitted_req,
+        syft_client_verify_key=client.verify_key,
+        syft_server_location=client.id,
+    )
 
-    request_event = ProjectRequest(linked_request=submitted_req)
-
-    if isinstance(project, ProjectSubmit):
+    if isinstance(project, ProjectSubmit) and project.bootstrap_events is not None:
         project.bootstrap_events.append(request_event)
     else:
-        result = project.add_event(request_event)
-        if isinstance(result, SyftError):
-            return result
-
+        project.add_event(request_event)
     return SyftSuccess(
         message=f"Code request for '{code.func_name}' successfully added to '{project.name}' Project. "
         f"To see code requests by a client, run `[your_client].code`"
@@ -652,42 +659,42 @@ class Project(SyftObject):
     __repr_attrs__ = ["name", "description", "created_by"]
     __attr_unique__ = ["name"]
 
-    # TODO: re-add users, members, leader_node_peer
+    # TODO: re-add users, members, leader_server_peer
     __hash_exclude_attrs__ = [
         "user_signing_key",
         "start_hash",
         "users",
         "members",
-        "leader_node_peer",
+        "leader_server_peer",
         "event_id_hashmap",
     ]
 
-    id: Optional[UID]
+    id: UID | None = None  # type: ignore[assignment]
     name: str
-    description: Optional[str]
-    members: List[NodeIdentity]
-    users: List[UserIdentity] = []
-    username: Optional[str]
+    description: str | None = None
+    members: list[ServerIdentity]
+    users: list[UserIdentity] = []
+    username: str | None = None
     created_by: str
-    start_hash: Optional[str]
+    start_hash: str | None = None
     # WARNING:  Do not add it to hash keys or print directly
-    user_signing_key: Optional[SyftSigningKey] = None
+    user_signing_key: SyftSigningKey | None = None
 
     # Project events
-    events: List[ProjectEvent] = []
-    event_id_hashmap: Dict[UID, ProjectEvent] = {}
+    events: list[ProjectEvent] = []
+    event_id_hashmap: dict[UID, ProjectEvent] = {}
 
     # Project sync
-    state_sync_leader: NodeIdentity
-    leader_node_peer: Optional[NodePeer]
+    state_sync_leader: ServerIdentity
+    leader_server_peer: ServerPeer | None = None
 
     # Unused
     consensus_model: ConsensusModel
-    project_permissions: Set[str]
+    project_permissions: set[str]
     # store: Dict[UID, Dict[UID, SyftObject]] = {}
     # permissions: Dict[UID, Dict[UID, Set[str]]] = {}
 
-    def _coll_repr_(self):
+    def _coll_repr_(self) -> dict:
         return {
             "name": self.name,
             "description": self.description,
@@ -697,12 +704,7 @@ class Project(SyftObject):
 
     def _repr_html_(self) -> Any:
         return (
-            f"""
-            <style>
-            .syft-project {{color: {SURFACE[options.color_theme]};}}
-            </style>
-            """
-            + "<div class='syft-project'>"
+            "<div class='syft-project'>"
             + f"<h3>{self.name}</h3>"
             + f"<p>{self.description}</p>"
             + f"<p><strong>Created by: </strong>{self.username} ({self.created_by})</p>"
@@ -711,14 +713,12 @@ class Project(SyftObject):
             + "</div>"
         )
 
-    def _broadcast_event(
-        self, project_event: ProjectEvent
-    ) -> Union[SyftSuccess, SyftError]:
+    def _broadcast_event(self, project_event: ProjectEvent) -> SyftSuccess:
         leader_client = self.get_leader_client(self.user_signing_key)
 
         return leader_client.api.services.project.broadcast_event(project_event)
 
-    def get_all_identities(self) -> List[Identity]:
+    def get_all_identities(self) -> list[Identity]:
         return [*self.members, *self.users]
 
     def key_in_project(self, verify_key: SyftVerifyKey) -> bool:
@@ -730,35 +730,40 @@ class Project(SyftObject):
 
     def get_identity_from_key(
         self, verify_key: SyftVerifyKey
-    ) -> List[Union[NodeIdentity, UserIdentity]]:
-        identities: List[Identity] = self.get_all_identities()
+    ) -> list[ServerIdentity | UserIdentity]:
+        identities: list[Identity] = self.get_all_identities()
         for identity in identities:
             if identity.verify_key == verify_key:
                 return identity
-        return SyftError(message=f"Member with verify key: {verify_key} not found")
+        raise SyftException(
+            public_message=f"Member with verify key: {verify_key} not found"
+        )
 
     def get_leader_client(self, signing_key: SyftSigningKey) -> SyftClient:
-        if self.leader_node_peer is None:
-            raise Exception("Leader node peer is not set")
+        if self.leader_server_peer is None:
+            raise Exception("Leader server peer is not set")
 
         if signing_key is None:
             raise Exception("Signing key is required to create leader client")
 
         verify_key = signing_key.verify_key
 
-        leader_client = SyftClientSessionCache.get_client_by_uid_and_verify_key(
-            verify_key=verify_key, node_uid=self.leader_node_peer.id
+        cached_leader_client = SyftClientSessionCache.get_client_by_uid_and_verify_key(
+            verify_key=verify_key, server_uid=self.leader_server_peer.id
         )
 
-        if leader_client is None:
-            leader_client = self.leader_node_peer.client_with_key(signing_key)
+        if cached_leader_client is None:
+            leader_client: SyftClient = self.leader_server_peer.client_with_key(
+                signing_key
+            ).unwrap()
             SyftClientSessionCache.add_client_by_uid_and_verify_key(
                 verify_key=verify_key,
-                node_uid=leader_client.id,
+                server_uid=leader_client.id,
                 syft_client=leader_client,
             )
+            return leader_client
 
-        return leader_client
+        return cached_leader_client
 
     def has_permission(self, verify_key: SyftVerifyKey) -> bool:
         # Currently the permission function, initially checks only if the
@@ -769,15 +774,13 @@ class Project(SyftObject):
 
     def _append_event(
         self, event: ProjectEvent, credentials: SyftSigningKey
-    ) -> Union[SyftSuccess, SyftError]:
+    ) -> SyftSuccess:
         prev_event = self.events[-1] if self.events else None
         valid = event.valid_descendant(self, prev_event)
         if not valid:
             return valid
 
         result = self._broadcast_event(event)
-        if isinstance(result, SyftError):
-            return result
         if isinstance(result, SyftNotReady):
             # If the client if out of sync, sync project updates from leader
             self.sync()
@@ -786,7 +789,7 @@ class Project(SyftObject):
             # Retrying broadcasting the event to leader
             # recursively call _append_event as due to network latency the event could reach late
             # and other events would be being streamed to the leader
-            # This scenario could lead to starvation of node trying to sync with the leader
+            # This scenario could lead to starvation of server trying to sync with the leader
             # This would be solved in our future leaderless approach
             return self._append_event(event=event, credentials=credentials)
 
@@ -802,8 +805,8 @@ class Project(SyftObject):
     def add_event(
         self,
         event: ProjectEvent,
-        credentials: Optional[Union[SyftSigningKey, SyftClient]] = None,
-    ) -> Union[SyftSuccess, SyftError]:
+        credentials: SyftSigningKey | SyftClient | None = None,
+    ) -> SyftSuccess:
         if event.id in self.event_ids:
             raise EventAlreadyAddedException(f"Event already added. {event}")
 
@@ -813,7 +816,9 @@ class Project(SyftObject):
             credentials = credentials.credentials
 
         if not isinstance(credentials, SyftSigningKey):
-            raise Exception(f"Adding an event requires a signing key. {credentials}")
+            raise SyftException(
+                public=f"Adding an event requires a signing key. {credentials}"
+            )
 
         event.creator_verify_key = credentials.verify_key
         event._pre_add_update(self)
@@ -823,7 +828,7 @@ class Project(SyftObject):
         result = self._append_event(event, credentials=credentials)
         return result
 
-    def validate_events(self, debug: bool = False) -> Union[SyftSuccess, SyftError]:
+    def validate_events(self, debug: bool = False) -> SyftSuccess:
         current_hash = self.start_hash
 
         def valid_str(current_hash: int) -> str:
@@ -844,16 +849,13 @@ class Project(SyftObject):
                     f"{icon} {type(event).__name__}: {event.id} "
                     f"after {type(prev_event).__name__}: {prev_event.id}"
                 )
-
-            if not result:
-                return result
             last_event = event
         return SyftSuccess(message=valid_str(current_hash))
 
-    def get_children(self, event: ProjectEvent) -> List[ProjectEvent]:
+    def get_children(self, event: ProjectEvent) -> list[ProjectEvent]:
         return self.get_events(parent_event_ids=event.id)
 
-    def get_parent(self, parent_uid: UID) -> Optional[ProjectEvent]:
+    def get_parent(self, parent_uid: UID) -> ProjectEvent | None:
         parent_event = None
         event_query = self.get_events(ids=parent_uid)
         if len(event_query) == 0:
@@ -868,10 +870,10 @@ class Project(SyftObject):
     # this would allow to query the sub events effectively
     def get_events(
         self,
-        types: Optional[Union[Type, List[Type]]] = None,
-        parent_event_ids: Optional[Union[UID, List[UID]]] = None,
-        ids: Optional[Union[UID, List[UID]]] = None,
-    ):
+        types: type | list[type] | None = None,
+        parent_event_ids: UID | list[UID] | None = None,
+        ids: UID | list[UID] | None = None,
+    ) -> list[ProjectEvent]:
         if types is None:
             types = []
         if isinstance(types, type):
@@ -913,18 +915,11 @@ class Project(SyftObject):
     def create_code_request(
         self,
         obj: SubmitUserCode,
-        client: Optional[SyftClient] = None,
-        reason: Optional[str] = None,
-    ):
+        client: SyftClient | None = None,
+        reason: str | None = None,
+    ) -> SyftSuccess:
         if client is None:
-            leader_client = self.get_leader_client(self.user_signing_key)
-            res = add_code_request_to_project(
-                project=self,
-                code=obj,
-                client=leader_client,
-                reason=reason,
-            )
-            return res
+            client = self.get_leader_client(self.user_signing_key)
         return add_code_request_to_project(
             project=self,
             code=obj,
@@ -932,12 +927,12 @@ class Project(SyftObject):
             reason=reason,
         )
 
-    def get_messages(self) -> List[Union[ProjectMessage, ProjectThreadMessage]]:
-        messages = []
-        for event in self.events:
-            if isinstance(event, (ProjectMessage, ProjectThreadMessage)):
-                messages.append(event)
-        return messages
+    def get_messages(self) -> list[ProjectMessage | ProjectThreadMessage]:
+        return [
+            event
+            for event in self.events
+            if isinstance(event, (ProjectMessage | ProjectThreadMessage))
+        ]
 
     @property
     def messages(self) -> str:
@@ -959,46 +954,42 @@ class Project(SyftObject):
     def get_last_seq_no(self) -> int:
         return len(self.events)
 
-    def send_message(self, message: str):
+    def send_message(self, message: str) -> SyftSuccess:
         message_event = ProjectMessage(message=message)
-        result = self.add_event(message_event)
-        if isinstance(result, SyftSuccess):
-            return SyftSuccess(message="Message sent successfully")
-        return result
+        self.add_event(message_event)
+        return SyftSuccess(message="Message sent successfully")
 
     def reply_message(
         self,
         reply: str,
-        message: Union[UID, ProjectMessage, ProjectThreadMessage],
-    ):
+        message: UID | ProjectMessage | ProjectThreadMessage,
+    ) -> SyftSuccess:
         if isinstance(message, UID):
             if message not in self.event_ids:
-                return SyftError(message=f"Message id: {message} not found")
+                raise SyftException(public_message=f"Message id: {message} not found")
             message = self.event_id_hashmap[message]
 
-        reply_event: Union[ProjectMessage, ProjectThreadMessage]
+        reply_event: ProjectMessage | ProjectThreadMessage
         if isinstance(message, ProjectMessage):
             reply_event = message.reply(reply)
-        elif isinstance(message, ProjectThreadMessage):
+        elif isinstance(message, ProjectThreadMessage):  # type: ignore[unreachable]
             reply_event = ProjectThreadMessage(
                 message=reply, parent_event_id=message.parent_event_id
             )
         else:
-            return SyftError(
-                message=f"You can only reply to a message: {type(message)}"
+            raise SyftException(
+                public_message=f"You can only reply to a message: {type(message)}"
                 "Kindly re-check the msg"
             )
 
-        result = self.add_event(reply_event)
-        if isinstance(result, SyftSuccess):
-            return SyftSuccess(message="Reply sent successfully")
-        return result
+        self.add_event(reply_event)
+        return SyftSuccess(message="Reply sent successfully")
 
     def create_poll(
         self,
-        question: Optional[str] = None,
-        choices: Optional[List[str]] = None,
-    ):
+        question: str | None = None,
+        choices: list[str] | None = None,
+    ) -> SyftSuccess:
         if (
             question is None
             or choices is None
@@ -1008,76 +999,63 @@ class Project(SyftObject):
             question, choices = poll_creation_wizard()
 
         poll_event = ProjectMultipleChoicePoll(question=question, choices=choices)
-        result = self.add_event(poll_event)
-        if isinstance(result, SyftSuccess):
-            return SyftSuccess(message="Poll created successfully")
-        return result
+        self.add_event(poll_event)
+        return SyftSuccess(message="Poll created successfully")
 
     def answer_poll(
         self,
-        poll: Union[UID, ProjectMultipleChoicePoll],
-        answer: Optional[int] = None,
-    ):
+        poll: UID | ProjectMultipleChoicePoll,
+        answer: int | None = None,
+    ) -> SyftSuccess:
         if isinstance(poll, UID):
             if poll not in self.event_ids:
-                return SyftError(message=f"Poll id: {poll} not found")
+                raise SyftException(public_message=f"Poll id: {poll} not found")
             poll = self.event_id_hashmap[poll]
 
         if not isinstance(poll, ProjectMultipleChoicePoll):
-            return SyftError(
-                message=f"You can only reply to a poll: {type(poll)}"
+            raise SyftException(  # type: ignore[unreachable]
+                public_message=f"You can only reply to a poll: {type(poll)}"
                 "Kindly re-check the poll"
             )
 
         if not isinstance(answer, int) or answer <= 0 or answer > len(poll.choices):
             answer = poll_answer_wizard(poll)
-
         answer_event = poll.answer(answer)
-
-        result = self.add_event(answer_event)
-        if isinstance(result, SyftSuccess):
-            return SyftSuccess(message="Poll answered successfully")
-        return result
+        self.add_event(answer_event)
+        return SyftSuccess(message="Poll answered successfully")
 
     def add_request(
         self,
         request: Request,
-    ):
-        linked_request = LinkedObject.from_obj(request, node_uid=request.node_uid)
+    ) -> SyftSuccess:
+        linked_request = LinkedObject.from_obj(request, server_uid=request.server_uid)
         request_event = ProjectRequest(linked_request=linked_request)
-        result = self.add_event(request_event)
-
-        if isinstance(result, SyftSuccess):
-            return SyftSuccess(message="Request created successfully")
-        return result
+        self.add_event(request_event)
+        return SyftSuccess(message="Request created successfully")
 
     # Since currently we do not have the notion of denying a request
     # Adding only approve request, which would later be used to approve or deny a request
     def approve_request(
         self,
-        request: Union[UID, ProjectRequest],
-    ):
+        request: UID | ProjectRequest,
+    ) -> SyftSuccess:
         if isinstance(request, UID):
             if request not in self.event_ids:
-                return SyftError(message=f"Request id: {request} not found")
+                raise SyftException(public_message=f"Request id: {request} not found")
             request = self.event_id_hashmap[request]
 
         request_event: ProjectRequestResponse
         if isinstance(request, ProjectRequest):
             request_event = request.approve()
-            if isinstance(request_event, SyftError):
-                return request_event
         else:
-            return SyftError(
-                message=f"You can only approve a request: {type(request)}"
+            raise SyftException(  # type: ignore[unreachable]
+                public_message=f"You can only approve a request: {type(request)}"
                 "Kindly re-check the request"
             )
-        result = self.add_event(request_event)
-        if isinstance(result, SyftSuccess):
-            return SyftSuccess(message="Request approved successfully")
-        return result
+        self.add_event(request_event)
+        return SyftSuccess(message="Request approved successfully")
 
-    def sync(self, verbose: Optional[bool] = True) -> Union[SyftSuccess, SyftError]:
+    def sync(self, verbose: bool | None = True) -> SyftSuccess:
         """Sync the latest project with the state sync leader"""
 
         leader_client = self.get_leader_client(self.user_signing_key)
@@ -1085,9 +1063,6 @@ class Project(SyftObject):
         unsynced_events = leader_client.api.services.project.sync(
             project_id=self.id, seq_no=self.get_last_seq_no()
         )
-        if isinstance(unsynced_events, SyftError):
-            return unsynced_events
-
         # UI progress bar for syncing
         if verbose and unsynced_events:
             with Progress() as progress:
@@ -1119,7 +1094,7 @@ class Project(SyftObject):
         return SyftSuccess(message="Synced project  with Leader")
 
     @property
-    def requests(self) -> List[Request]:
+    def requests(self) -> list[Request]:
         return [
             event.request for event in self.events if isinstance(event, ProjectRequest)
         ]
@@ -1141,7 +1116,7 @@ class ProjectSubmit(SyftObject):
         "users",
         "members",
         "clients",
-        "leader_node_route",
+        "leader_server_route",
         "bootstrap_events",
     ]
 
@@ -1153,33 +1128,33 @@ class ProjectSubmit(SyftObject):
 
     # Init args
     name: str
-    description: Optional[str]
-    members: Union[List[SyftClient], List[NodeIdentity]]
+    description: str | None = None
+    members: list[SyftClient] | list[ServerIdentity]
 
     # These will be automatically populated
-    users: List[UserIdentity] = []
-    created_by: Optional[str] = None
-    username: Optional[str]
-    clients: List[SyftClient] = []  # List of member clients
+    users: list[UserIdentity] = []
+    created_by: str | None = None
+    username: str | None = None
+    clients: list[SyftClient] = []  # List of member clients
     start_hash: str = ""
 
     # Project sync args
-    leader_node_route: Optional[NodeRoute]
-    state_sync_leader: Optional[NodeIdentity]
-    bootstrap_events: Optional[List[ProjectEvent]] = []
+    leader_server_route: ServerRoute | None = None
+    state_sync_leader: ServerIdentity | None = None
+    bootstrap_events: list[ProjectEvent] | None = []
 
     # Unused at the moment
-    project_permissions: Set[str] = set()
+    project_permissions: set[str] = set()
     consensus_model: ConsensusModel = DemocraticConsensusModel()
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
 
         # Preserve member SyftClients in a private variable clients
-        # self.members will be List[NodeIdentity] on the node i.e. self.clients = []
+        # self.members will be List[ServerIdentity] on the server i.e. self.clients = []
         self.clients = self.get_syft_clients(self.members)
 
-        # If ProjectSubmit is being re-created at node side
+        # If ProjectSubmit is being re-created at server side
         if len(self.clients) == 0:
             return
 
@@ -1190,27 +1165,28 @@ class ProjectSubmit(SyftObject):
         self.users = [UserIdentity.from_client(client) for client in self.clients]
 
         # Assign logged in user name as project creator
-        self.username = self.clients[0].me.name or ""
+        if isinstance(self.clients[0].account, UserView):
+            self.username = self.clients[0].account.name
+        else:
+            self.username = ""
 
-        # Convert SyftClients to NodeIdentities
-        self.members = list(map(self.to_node_identity, self.members))
+        # Convert SyftClients to ServerIdentities
+        self.members = list(map(self.to_server_identity, self.members))
 
     def _repr_html_(self) -> Any:
         return (
-            f"""
-            <style>
-            .syft-project-create {{color: {SURFACE[options.color_theme]};}}
-            </style>
-            """
-            + "<div class='syft-project-create'>"
+            "<div class='syft-project-create'>"
             + f"<h3>{self.name}</h3>"
             + f"<p>{self.description}</p>"
             + f"<p><strong>Created by: </strong>{self.username} ({self.created_by})</p>"
             + "</div>"
         )
 
-    @validator("members", pre=True)
-    def verify_members(cls, val: Union[List[SyftClient], List[NodeIdentity]]):
+    @field_validator("members", mode="before")
+    @classmethod
+    def verify_members(
+        cls, val: list[SyftClient] | list[ServerIdentity]
+    ) -> list[SyftClient] | list[ServerIdentity]:
         # SyftClients must be logged in by the same emails
         clients = cls.get_syft_clients(val)
         if len(clients) > 0:
@@ -1222,24 +1198,26 @@ class ProjectSubmit(SyftObject):
         return val
 
     @staticmethod
-    def get_syft_clients(vals: Union[List[SyftClient], List[NodeIdentity]]):
+    def get_syft_clients(
+        vals: list[SyftClient] | list[ServerIdentity],
+    ) -> list[SyftClient]:
         return [client for client in vals if isinstance(client, SyftClient)]
 
     @staticmethod
-    def to_node_identity(val: Union[SyftClient, NodeIdentity]):
-        if isinstance(val, NodeIdentity):
+    def to_server_identity(val: SyftClient | ServerIdentity) -> ServerIdentity:
+        if isinstance(val, ServerIdentity):
             return val
-        elif isinstance(val, SyftClient):
-            metadata = val.metadata.to(NodeMetadata)
-            return metadata.to(NodeIdentity)
+        elif isinstance(val, SyftClient) and val.metadata is not None:
+            metadata = val.metadata.to(ServerMetadata)
+            return metadata.to(ServerIdentity)
         else:
             raise SyftException(
-                f"members must be SyftClient or NodeIdentity. Received: {type(val)}"
+                f"members must be SyftClient or ServerIdentity. Received: {type(val)}"
             )
 
     def create_code_request(
-        self, obj: SubmitUserCode, client: SyftClient, reason: Optional[str] = None
-    ):
+        self, obj: SubmitUserCode, client: SyftClient, reason: str | None = None
+    ) -> SyftSuccess:
         return add_code_request_to_project(
             project=self,
             code=obj,
@@ -1247,81 +1225,77 @@ class ProjectSubmit(SyftObject):
             reason=reason,
         )
 
-    def start(self, return_all_projects=False) -> Project:
+    @deprecated(
+        reason="Project.start has been renamed to Project.send", return_syfterror=True
+    )
+    def start(self, return_all_projects: bool = False) -> Project | list[Project]:
+        return self.send(return_all_projects=return_all_projects)
+
+    def send(self, return_all_projects: bool = False) -> Project | list[Project]:
         # Currently we are assuming that the first member is the leader
         # This would be changed in our future leaderless approach
         leader = self.clients[0]
         followers = self.clients[1:]
 
+        # Check for DS role across all members
+        self._pre_submit_checks(self.clients)
+
+        # Exchange route between leaders and followers
+        self._exchange_routes(leader, followers)
+
+        # create project for each server
+        projects_map = self._create_projects(self.clients)
+
+        # bootstrap project with pending events on leader server's project
+        self._bootstrap_events(projects_map[leader.id])  # type: ignore
+
+        if return_all_projects:
+            return list(projects_map.values())
+
+        return projects_map[leader.id]  # type: ignore
+
+    def _pre_submit_checks(self, clients: list[SyftClient]) -> bool:
         try:
-            # Check for DS role across all members
-            self._pre_submit_checks(self.clients)
-
-            # Exchange route between leaders and followers
-            self._exchange_routes(leader, followers)
-
-            # create project for each node
-            projects_map = self._create_projects(self.clients)
-
-            # bootstrap project with pending events on leader node's project
-            self._bootstrap_events(projects_map[leader])
-
-            if return_all_projects:
-                return list(projects_map.values())
-
-            return projects_map[leader]
-        except SyftException as exp:
-            return SyftError(message=str(exp))
-
-    def _pre_submit_checks(self, clients: List[SyftClient]):
-        try:
-            # Check if the user can create projects
             for client in clients:
-                result = client.api.services.project.can_create_project()
-                if isinstance(result, SyftError):
-                    raise SyftException(result.message)
+                client.api.services.project.can_create_project()
         except Exception:
-            raise SyftException("Only Data Scientists can create projects")
+            raise SyftException(
+                public_message="Only Data Scientists can create projects"
+            )
 
         return True
 
-    def _exchange_routes(self, leader: SyftClient, followers: List[SyftClient]):
+    def _exchange_routes(self, leader: SyftClient, followers: list[SyftClient]) -> None:
         # Since we are implementing a leader based system
         # To be able to optimize exchanging routes.
         # We require only the leader to exchange routes with all the members
-        # Meaning if we could guarantee, that the leader node is able to reach the members
+        # Meaning if we could guarantee, that the leader server is able to reach the members
         # the project events could be broadcasted to all the members
 
         for follower in followers:
-            result = leader.exchange_route(follower)
-            if isinstance(result, SyftError):
-                raise SyftException(result.message)
+            leader.exchange_route(follower)
 
-        self.leader_node_route = connection_to_route(leader.connection)
+        self.leader_server_route = connection_to_route(leader.connection)
 
-    def _create_projects(self, clients: List[SyftClient]):
-        projects: Dict[SyftClient, Project] = {}
+    def _create_projects(self, clients: list[SyftClient]) -> dict[UID, Project]:
+        projects: dict[UID, Project] = {}
 
         for client in clients:
-            result = client.api.services.project.create_project(project=self)
-            if isinstance(result, SyftError):
-                raise SyftException(result.message)
-            projects[client] = result
+            result = client.api.services.project.create_project(project=self).value
+            projects[client.id] = result  # type: ignore
 
         return projects
 
-    def _bootstrap_events(self, leader_project: Project):
+    def _bootstrap_events(self, leader_project: Project) -> None:
         if not self.bootstrap_events:
             return
 
         while len(self.bootstrap_events) > 0:
             event = self.bootstrap_events.pop(0)
-            result = leader_project.add_event(event)
-            if isinstance(result, SyftError):
-                raise SyftException(result.message)
+            leader_project.add_event(event)
 
 
-def add_members_as_owners(members: List[SyftVerifyKey]) -> Set[str]:
+def add_members_as_owners(members: list[SyftVerifyKey]) -> set[str]:
     keys = set()
     for member in members:
         owner_key = f"OWNER_{member.verify_key}"
@@ -1330,19 +1304,21 @@ def add_members_as_owners(members: List[SyftVerifyKey]) -> Set[str]:
 
 
 def elect_leader(context: TransformContext) -> TransformContext:
-    if len(context.output["members"]) == 0:
-        raise Exception("Project's require at least one member")
-
-    context.output["state_sync_leader"] = context.output["members"][0]
+    if context.output is not None:
+        if len(context.output["members"]) == 0:
+            raise ValueError("Project's require at least one member")
+        context.output["state_sync_leader"] = context.output["members"][0]
 
     return context
 
 
 def check_permissions(context: TransformContext) -> TransformContext:
-    if len(context.output["members"]) > 1:
-        # more than 1 node
-        pass
+    if context.output is None:
+        return context
 
+    if len(context.output["members"]) > 1:
+        # more than 1 server
+        pass
     # check at least one owner
     if len(context.output["project_permissions"]) == 0:
         project_permissions = context.output["project_permissions"]
@@ -1355,16 +1331,17 @@ def check_permissions(context: TransformContext) -> TransformContext:
 
 
 def add_creator_name(context: TransformContext) -> TransformContext:
-    context.output["username"] = context.obj.username
+    if context.output is not None and context.obj is not None:
+        context.output["username"] = context.obj.username
     return context
 
 
 @transform(ProjectSubmit, Project)
-def new_projectsubmit_to_project() -> List[Callable]:
+def new_projectsubmit_to_project() -> list[Callable]:
     return [elect_leader, check_permissions, add_creator_name]
 
 
-def hash_object(obj: Any) -> Tuple[bytes, str]:
+def hash_object(obj: Any) -> tuple[bytes, str]:
     """Hashes an object using sha256
 
     Args:
@@ -1378,7 +1355,7 @@ def hash_object(obj: Any) -> Tuple[bytes, str]:
     return (hash.digest(), hash.hexdigest())
 
 
-def create_project_hash(project: Project) -> Tuple[bytes, str]:
+def create_project_hash(project: Project) -> tuple[bytes, str]:
     # Creating a custom hash for the project
     # as the recursive hash is yet to be revamped
     # for primitives python types
@@ -1397,7 +1374,7 @@ def create_project_hash(project: Project) -> Tuple[bytes, str]:
     )
 
 
-def create_project_event_hash(project_event: ProjectEvent) -> Tuple[bytes, str]:
+def create_project_event_hash(project_event: ProjectEvent) -> tuple[bytes, str]:
     # Creating a custom hash for the project
     # as the recursive hash is yet to be revamped
     # for primitives python types.

@@ -1,19 +1,18 @@
 # stdlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import FunctionType
-from typing import Callable
-from typing import Optional
 
 # third party
-from pydantic import EmailError
 from pydantic import EmailStr
+from pydantic_core import PydanticCustomError
 import pytest
 
 # syft absolute
 from syft.types.transforms import NotNone
 from syft.types.transforms import TransformContext
 from syft.types.transforms import add_credentials_for_key
-from syft.types.transforms import add_node_uid_for_key
+from syft.types.transforms import add_server_uid_for_key
 from syft.types.transforms import drop
 from syft.types.transforms import generate_id
 from syft.types.transforms import geteitherattr
@@ -29,7 +28,7 @@ from syft.types.uid import UID
     "syft_obj, context",
     [
         ("admin_user", "authed_context"),
-        ("guest_user", "node_context"),
+        ("guest_user", "server_context"),
     ],
 )
 def test_transformcontext(syft_obj, context, request):
@@ -46,12 +45,12 @@ def test_transformcontext(syft_obj, context, request):
     if hasattr(context, "credentials"):
         assert transform_context.credentials == context.credentials
 
-    if hasattr(context, "node"):
-        assert transform_context.node == context.node
+    if hasattr(context, "server"):
+        assert transform_context.server == context.server
 
-    node_context = transform_context.to_node_context()
+    server_context = transform_context.to_server_context()
 
-    assert node_context == context
+    assert server_context == context
 
 
 @pytest.mark.parametrize(
@@ -92,7 +91,7 @@ def test_geteitherattr(output, key, default):
         ("no_key", "no_value"),
     ],
 )
-def test_make_set_default(faker, key, value, node_context):
+def test_make_set_default(faker, key, value, server_context):
     result = make_set_default(key, value)
     assert isinstance(result, FunctionType)
     assert isinstance(result, Callable)
@@ -107,7 +106,7 @@ def test_make_set_default(faker, key, value, node_context):
     mock_obj = MockObject(obj_key=faker.name())
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     resultant_context = result(transform_context)
@@ -124,7 +123,7 @@ def test_make_set_default(faker, key, value, node_context):
         assert resultant_context.output[key] == mock_obj.obj_key
 
 
-def test_drop(faker, node_context):
+def test_drop(faker, server_context):
     @dataclass
     class MockObject:
         name: str
@@ -147,7 +146,7 @@ def test_drop(faker, node_context):
     assert isinstance(result, Callable)
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     expected_output = dict(mock_obj).copy()
@@ -165,7 +164,7 @@ def test_drop(faker, node_context):
     assert resultant_context.output == expected_output
 
 
-def test_keep(faker, node_context):
+def test_keep(faker, server_context):
     @dataclass
     class MockObject:
         name: str
@@ -188,7 +187,7 @@ def test_keep(faker, node_context):
     assert isinstance(result, Callable)
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     mock_obj_dict = dict(mock_obj)
@@ -207,7 +206,7 @@ def test_keep(faker, node_context):
     assert resultant_context.output == expected_output
 
 
-def test_rename(faker, node_context):
+def test_rename(faker, server_context):
     @dataclass
     class MockObject:
         name: str
@@ -231,7 +230,7 @@ def test_rename(faker, node_context):
     assert isinstance(result, Callable)
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     mock_obj_dict = dict(mock_obj)
@@ -246,7 +245,7 @@ def test_rename(faker, node_context):
     assert resultant_context.output == expected_output
 
 
-def test_generate_id(faker, node_context):
+def test_generate_id(faker, server_context):
     @dataclass
     class MockObject:
         name: str
@@ -258,7 +257,7 @@ def test_generate_id(faker, node_context):
 
     @dataclass
     class MockObjectWithId:
-        id: Optional[UID]
+        id: UID | None
         name: str
         age: int
         company: str
@@ -273,7 +272,7 @@ def test_generate_id(faker, node_context):
     )
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     result = generate_id(context=transform_context)
@@ -289,7 +288,7 @@ def test_generate_id(faker, node_context):
     )
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     result = generate_id(context=transform_context)
@@ -306,7 +305,7 @@ def test_generate_id(faker, node_context):
     )
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     result = generate_id(context=transform_context)
@@ -341,7 +340,7 @@ def test_add_credentials_for_key(faker, authed_context):
     assert result.output[key] == authed_context.credentials
 
 
-def test_add_node_uid_for_key(faker, node_context):
+def test_add_server_uid_for_key(faker, server_context):
     @dataclass
     class MockObject:
         name: str
@@ -354,23 +353,23 @@ def test_add_node_uid_for_key(faker, node_context):
     )
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     key = "random_uid_key"
 
-    result_func = add_node_uid_for_key(key=key)
+    result_func = add_server_uid_for_key(key=key)
     assert isinstance(result_func, FunctionType)
     result = result_func(context=transform_context)
     assert isinstance(result, TransformContext)
     assert key in result.output
-    assert result.output[key] == node_context.node.id
+    assert result.output[key] == server_context.server.id
 
 
-def test_validate_url(faker, node_context):
+def test_validate_url(faker, server_context):
     @dataclass
     class MockObject:
-        url: Optional[str]
+        url: str | None
 
         def __iter__(self):
             yield from self.__dict__.items()
@@ -378,7 +377,7 @@ def test_validate_url(faker, node_context):
     mock_obj = MockObject(url=None)
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     # no change in context if url is None
@@ -391,7 +390,7 @@ def test_validate_url(faker, node_context):
     mock_obj = MockObject(url=url_with_port)
 
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
     result = validate_url(transform_context)
@@ -399,7 +398,7 @@ def test_validate_url(faker, node_context):
     assert result.output["url"] == url
 
 
-def test_validate_email(faker, node_context):
+def test_validate_email(faker, server_context):
     @dataclass
     class MockObject:
         email: str
@@ -409,7 +408,7 @@ def test_validate_email(faker, node_context):
 
     mock_obj = MockObject(email=None)
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
     result = validate_email(transform_context)
     assert isinstance(result, TransformContext)
@@ -417,17 +416,17 @@ def test_validate_email(faker, node_context):
 
     mock_obj = MockObject(email=faker.email())
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
     result = validate_email(transform_context)
     assert isinstance(result, TransformContext)
-    assert isinstance(result.output["email"], EmailStr)
+    assert EmailStr._validate(result.output["email"])
     assert result.output["email"] == mock_obj.email
 
     mock_obj = MockObject(email=faker.name())
     transform_context = TransformContext.from_context(
-        obj=mock_obj, context=node_context
+        obj=mock_obj, context=server_context
     )
 
-    with pytest.raises(EmailError):
+    with pytest.raises(PydanticCustomError):
         validate_email(transform_context)

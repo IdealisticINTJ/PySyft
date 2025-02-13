@@ -1,15 +1,11 @@
 # stdlib
+from collections.abc import Callable
 from enum import Enum
 from enum import EnumMeta
-import sys
+import os
+import tempfile
 import types
 from typing import Any
-from typing import Callable
-from typing import List
-from typing import Optional
-from typing import Set
-from typing import Type
-from typing import Union
 
 # third party
 from capnp.lib.capnp import _DynamicStructBuilder
@@ -19,16 +15,20 @@ from pydantic import BaseModel
 import syft as sy
 
 # relative
-from ..util.util import get_fully_qualified_name
-from ..util.util import index_syft_by_module_name
+from ..types.syft_object_registry import SyftObjectRegistry
 from .capnp import get_capnp_schema
+from .util import compatible_with_large_file_writes_capnp
 
-TYPE_BANK = {}
+TYPE_BANK = {}  # type: ignore
+SYFT_CLASSES_MISSING_CANONICAL_NAME = []
 
-recursive_scheme = get_capnp_schema("recursive_serde.capnp").RecursiveSerde  # type: ignore
+recursive_scheme = get_capnp_schema("recursive_serde.capnp").RecursiveSerde
+
+SPOOLED_FILE_MAX_SIZE_SERDE = 50 * (1024**2)  # 50MB
+DEFAULT_EXCLUDE_ATTRS: set[str] = {"syft_pre_hooks__", "syft_post_hooks__"}
 
 
-def get_types(cls: Type, keys: Optional[List[str]] = None) -> Optional[List[Type]]:
+def get_types(cls: type, keys: list[str] | None = None) -> list[type] | None:
     if keys is None:
         return None
     types = []
@@ -48,7 +48,7 @@ def get_types(cls: Type, keys: Optional[List[str]] = None) -> Optional[List[Type
     return types
 
 
-def check_fqn_alias(cls: Union[object, type]) -> Optional[tuple]:
+def check_fqn_alias(cls: object | type) -> tuple[str, ...] | None:
     """Currently, typing.Any has different metaclasses in different versions of Python 🤦‍♂️.
     For Python <=3.10
     Any is an instance of typing._SpecialForm
@@ -79,22 +79,85 @@ def check_fqn_alias(cls: Union[object, type]) -> Optional[tuple]:
     return None
 
 
+def has_canonical_name_version(
+    cls: type, cannonical_name: str | None, version: int | None
+) -> bool:
+    cls_canonical_name = getattr(cls, "__canonical_name__", None)
+    cls_version = getattr(cls, "__version__", None)
+    return bool(cls_canonical_name or cannonical_name) and bool(cls_version or version)
+
+
+def validate_cannonical_name_version(
+    cls: type, canonical_name: str | None, version: int | None
+) -> tuple[str, int]:
+    cls_canonical_name = getattr(cls, "__canonical_name__", None)
+    cls_version = getattr(cls, "__version__", None)
+    if cls_canonical_name and canonical_name:
+        raise ValueError(
+            "Cannot specify both __canonical_name__ attribute and cannonical_name argument."
+        )
+    if cls_version and version:
+        raise ValueError(
+            "Cannot specify both __version__ attribute and version argument."
+        )
+    if cls_canonical_name is None and canonical_name is None:
+        raise ValueError(
+            "Must specify either __canonical_name__ attribute or cannonical_name argument."
+        )
+    if cls_version is None and version is None:
+        raise ValueError(
+            "Must specify either __version__ attribute or version argument."
+        )
+
+    canonical_name = canonical_name or cls_canonical_name
+    version = version or cls_version
+    return canonical_name, version  # type: ignore
+
+
+def skip_unregistered_class(
+    cls: type, canonical_name: str | None, version: str | None
+) -> bool:
+    """
+    Used to gather all classes that are missing canonical_name and version for development.
+
+    Returns True if the class should be skipped, False otherwise.
+    """
+
+    search_unregistered_classes = (
+        os.getenv("SYFT_SEARCH_MISSING_CANONICAL_NAME", False) == "true"
+    )
+    if not search_unregistered_classes:
+        return False
+    if not has_canonical_name_version(cls, canonical_name, version):
+        if cls.__module__.startswith("syft."):
+            SYFT_CLASSES_MISSING_CANONICAL_NAME.append(cls)
+            return True
+    return False
+
+
 def recursive_serde_register(
-    cls: Union[object, type],
-    serialize: Optional[Callable] = None,
-    deserialize: Optional[Callable] = None,
-    serialize_attrs: Optional[List] = None,
-    exclude_attrs: Optional[List] = None,
-    inherit_attrs: Optional[bool] = True,
-    inheritable_attrs: Optional[bool] = True,
+    cls: object | type,
+    serialize: Callable | None = None,
+    deserialize: Callable | None = None,
+    serialize_attrs: list | None = None,
+    exclude_attrs: list | None = None,
+    inherit_attrs: bool | None = True,
+    inheritable_attrs: bool | None = True,
+    canonical_name: str | None = None,
+    version: int | None = None,
 ) -> None:
     pydantic_fields = None
     base_attrs = None
-    attribute_list: Set[str] = set()
+    attribute_list: set[str] = set()
 
-    alias_fqn = check_fqn_alias(cls)
     cls = type(cls) if not isinstance(cls, type) else cls
-    fqn = f"{cls.__module__}.{cls.__name__}"
+
+    if skip_unregistered_class(cls, canonical_name, version):
+        return
+
+    canonical_name, version = validate_cannonical_name_version(
+        cls, canonical_name, version
+    )
 
     nonrecursive = bool(serialize and deserialize)
     _serialize = serialize if nonrecursive else rs_object2proto
@@ -111,9 +174,14 @@ def recursive_serde_register(
         # if pydantic object and attrs are provided, the get attrs from __fields__
         # cls.__fields__ auto inherits attrs
         pydantic_fields = [
-            f.name
-            for f in cls.__fields__.values()
-            if f.outer_type_ not in (Callable, types.FunctionType, types.LambdaType)
+            field
+            for field, field_info in cls.model_fields.items()
+            if not (
+                field_info.annotation is not None
+                and hasattr(field_info.annotation, "__origin__")
+                and field_info.annotation.__origin__
+                in (Callable, types.FunctionType, types.LambdaType)
+            )
         ]
         attribute_list.update(pydantic_fields)
 
@@ -125,7 +193,7 @@ def recursive_serde_register(
         attribute_list.update(["value"])
 
     exclude_attrs = [] if exclude_attrs is None else exclude_attrs
-    attribute_list = attribute_list - set(exclude_attrs)
+    attribute_list = attribute_list - set(exclude_attrs) - DEFAULT_EXCLUDE_ATTRS
 
     if inheritable_attrs and attribute_list and not is_pydantic:
         # only set __syft_serializable__ for non-pydantic classes because
@@ -135,7 +203,6 @@ def recursive_serde_register(
     attributes = set(attribute_list) if attribute_list else None
     attribute_types = get_types(cls, attributes)
     serde_overrides = getattr(cls, "__serde_overrides__", {})
-    version = getattr(cls, "__version__", None)
 
     # without fqn duplicate class names overwrite
     serde_attributes = (
@@ -151,27 +218,49 @@ def recursive_serde_register(
         version,
     )
 
-    TYPE_BANK[fqn] = serde_attributes
+    SyftObjectRegistry.register_cls(canonical_name, version, serde_attributes)
 
+    alias_fqn = check_fqn_alias(cls)
     if isinstance(alias_fqn, tuple):
         for alias in alias_fqn:
-            TYPE_BANK[alias] = serde_attributes
+            alias_canonical_name = canonical_name + f"_{alias}"
+            SyftObjectRegistry.register_cls(alias_canonical_name, 1, serde_attributes)
 
 
 def chunk_bytes(
-    data: bytes, field_name: Union[str, int], builder: _DynamicStructBuilder
+    field_obj: Any,
+    ser_func: Callable,
+    field_name: str | int,
+    builder: _DynamicStructBuilder,
 ) -> None:
-    CHUNK_SIZE = int(5.12e8)  # capnp max for a List(Data) field
-    list_size = len(data) // CHUNK_SIZE + 1
-    data_lst = builder.init(field_name, list_size)
-    END_INDEX = CHUNK_SIZE
-    for idx in range(list_size):
-        START_INDEX = idx * CHUNK_SIZE
-        END_INDEX = min(START_INDEX + CHUNK_SIZE, len(data))
-        data_lst[idx] = data[START_INDEX:END_INDEX]
+    data = ser_func(field_obj)
+    size_of_data = len(data)
+    if compatible_with_large_file_writes_capnp(size_of_data):
+        with tempfile.TemporaryFile() as tmp_file:
+            # Write data to a file to save RAM
+            tmp_file.write(data)
+            tmp_file.seek(0)
+            del data
+
+            CHUNK_SIZE = int(5.12e8)  # capnp max for a List(Data) field
+            list_size = size_of_data // CHUNK_SIZE + 1
+            data_lst = builder.init(field_name, list_size)
+            for idx in range(list_size):
+                bytes_to_read = min(CHUNK_SIZE, size_of_data)
+                data_lst[idx] = tmp_file.read(bytes_to_read)
+                size_of_data -= CHUNK_SIZE
+    else:
+        CHUNK_SIZE = int(5.12e8)  # capnp max for a List(Data) field
+        list_size = len(data) // CHUNK_SIZE + 1
+        data_lst = builder.init(field_name, list_size)
+        END_INDEX = CHUNK_SIZE
+        for idx in range(list_size):
+            START_INDEX = idx * CHUNK_SIZE
+            END_INDEX = min(START_INDEX + CHUNK_SIZE, len(data))
+            data_lst[idx] = data[START_INDEX:END_INDEX]
 
 
-def combine_bytes(capnp_list: List[bytes]) -> bytes:
+def combine_bytes(capnp_list: list[bytes]) -> bytes:
     # TODO: make sure this doesn't copy, perhaps allocate a fixed size buffer
     # and move the bytes into it as we go
     bytes_value = b""
@@ -189,31 +278,38 @@ def rs_object2proto(self: Any, for_hashing: bool = False) -> _DynamicStructBuild
         is_type = True
 
     msg = recursive_scheme.new_message()
-    fqn = get_fully_qualified_name(self)
-    if fqn not in TYPE_BANK:
-        # third party
-        raise Exception(f"{fqn} not in TYPE_BANK")
 
-    msg.fullyQualifiedName = fqn
+    # todo: rewrite and make sure every object has a canonical name and version
+    canonical_name, version = SyftObjectRegistry.get_canonical_name_version(self)
+
+    if not SyftObjectRegistry.has_serde_class(canonical_name, version):
+        # third party
+        raise Exception(
+            f"obj2proto: {canonical_name} version {version} not in SyftObjectRegistry"
+        )
+
+    msg.canonicalName = canonical_name
+    msg.version = version
+
     (
         nonrecursive,
         serialize,
-        deserialize,
+        _,
         attribute_list,
         exclude_attrs_list,
         serde_overrides,
         hash_exclude_attrs,
-        cls,
-        attribute_types,
-        version,
-    ) = TYPE_BANK[fqn]
+        _,
+        _,
+        _,
+    ) = SyftObjectRegistry.get_serde_properties(canonical_name, version)
 
     if nonrecursive or is_type:
         if serialize is None:
             raise Exception(
                 f"Cant serialize {type(self)} nonrecursive without serialize."
             )
-        chunk_bytes(serialize(self), "nonrecursiveBlob", msg)
+        chunk_bytes(self, serialize, "nonrecursiveBlob", msg)
         return msg
 
     if attribute_list is None:
@@ -246,9 +342,13 @@ def rs_object2proto(self: Any, for_hashing: bool = False) -> _DynamicStructBuild
         if isinstance(field_obj, types.FunctionType):
             continue
 
-        serialized = sy.serialize(field_obj, to_bytes=True, for_hashing=for_hashing)
         msg.fieldsName[idx] = attr_name
-        chunk_bytes(serialized, idx, msg.fieldsData)
+        chunk_bytes(
+            field_obj,
+            lambda x: sy.serialize(x, to_bytes=True, for_hashing=for_hashing),
+            idx,
+            msg.fieldsData,
+        )
 
     return msg
 
@@ -256,41 +356,45 @@ def rs_object2proto(self: Any, for_hashing: bool = False) -> _DynamicStructBuild
 def rs_bytes2object(blob: bytes) -> Any:
     MAX_TRAVERSAL_LIMIT = 2**64 - 1
 
-    with recursive_scheme.from_bytes(  # type: ignore
+    with recursive_scheme.from_bytes(
         blob, traversal_limit_in_words=MAX_TRAVERSAL_LIMIT
     ) as msg:
         return rs_proto2object(msg)
+
+
+def map_fqns_for_backward_compatibility(fqn: str) -> str:
+    """for backwards compatibility with 0.8.6. Sometimes classes where moved to another file. Which is
+    exactly why we are implementing it differently"""
+    mapping = {
+        "syft.service.dataset.dataset.MarkdownDescription": "syft.util.misc_objs.MarkdownDescription",
+        # "syft.service.object_search.object_migration_state.SyftObjectMigrationState": "syft.service.migration.object_migration_state.SyftObjectMigrationState",  # noqa: E501
+    }
+    if fqn in mapping:
+        return mapping[fqn]
+    else:
+        return fqn
 
 
 def rs_proto2object(proto: _DynamicStructBuilder) -> Any:
     # relative
     from .deserialize import _deserialize
 
-    # clean this mess, Tudor
-    module_parts = proto.fullyQualifiedName.split(".")
-    klass = module_parts.pop()
-    class_type: Type = type(None)
+    class_type: type | Any = type(None)
 
-    if klass != "NoneType":
-        try:
-            class_type = index_syft_by_module_name(proto.fullyQualifiedName)  # type: ignore
-        except Exception:  # nosec
-            try:
-                class_type = getattr(sys.modules[".".join(module_parts)], klass)
-            except Exception:  # nosec
-                if "syft.user" in proto.fullyQualifiedName:
-                    # relative
-                    from ..node.node import CODE_RELOADER
+    canonical_name = proto.canonicalName
+    version = getattr(proto, "version", -1)
 
-                    for _, load_user_code in CODE_RELOADER.items():
-                        load_user_code()
-                try:
-                    class_type = getattr(sys.modules[".".join(module_parts)], klass)
-                except Exception:  # nosec
-                    pass
+    if not SyftObjectRegistry.has_serde_class(canonical_name, version):
+        # relative
+        from ..server.server import CODE_RELOADER
 
-    if proto.fullyQualifiedName not in TYPE_BANK:
-        raise Exception(f"{proto.fullyQualifiedName} not in TYPE_BANK")
+        for load_user_code in CODE_RELOADER.values():
+            load_user_code()
+        # third party
+        if not SyftObjectRegistry.has_serde_class(canonical_name, version):
+            raise Exception(
+                f"proto2obj: {canonical_name} version {version} not in SyftObjectRegistry"
+            )
 
     # TODO: 🐉 sort this out, basically sometimes the syft.user classes are not in the
     # module name space in sub-processes or threads even though they are loaded on start
@@ -299,20 +403,18 @@ def rs_proto2object(proto: _DynamicStructBuilder) -> Any:
     # causes some errors so it seems like we want to get the local one where possible
     (
         nonrecursive,
-        serialize,
+        _,
         deserialize,
-        attribute_list,
-        exclude_attrs_list,
+        _,
+        _,
         serde_overrides,
-        hash_exclude_attrs,
+        _,
         cls,
-        attribute_types,
+        _,
         version,
-    ) = TYPE_BANK[proto.fullyQualifiedName]
+    ) = SyftObjectRegistry.get_serde_properties(canonical_name, version)
 
-    if class_type == type(None):
-        # yes this looks stupid but it works and the opposite breaks
-        class_type = cls
+    class_type = cls
 
     if nonrecursive:
         if deserialize is None:
@@ -338,19 +440,20 @@ def rs_proto2object(proto: _DynamicStructBuilder) -> Any:
         return class_type.serde_constructor(kwargs)
 
     if issubclass(class_type, Enum) and "value" in kwargs:
-        obj = class_type.__new__(class_type, kwargs["value"])  # type: ignore
+        obj = class_type.__new__(class_type, kwargs["value"])
     elif issubclass(class_type, BaseModel):
         # if we skip the __new__ flow of BaseModel we get the error
         # AttributeError: object has no attribute '__fields_set__'
 
-        if "syft.user" in proto.fullyQualifiedName:
-            # weird issues with pydantic and ForwardRef on user classes being inited
-            # with custom state args / kwargs
-            obj = class_type()
-            for attr_name, attr_value in kwargs.items():
-                setattr(obj, attr_name, attr_value)
-        else:
-            obj = class_type(**kwargs)
+        # if "syft.user" in proto.fullyQualifiedName:
+        #     # weird issues with pydantic and ForwardRef on user classes being inited
+        #     # with custom state args / kwargs
+        #     obj = class_type()
+        #     for attr_name, attr_value in kwargs.items():
+        #         setattr(obj, attr_name, attr_value)
+        # else:
+        #     obj = class_type(**kwargs)
+        obj = class_type(**kwargs)
 
     else:
         obj = class_type.__new__(class_type)  # type: ignore

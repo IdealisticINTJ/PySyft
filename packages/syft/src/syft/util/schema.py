@@ -4,17 +4,79 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Tuple
-from typing import Type
 
 # syft absolute
 import syft as sy
 
+# relative
+from .decorators import deprecated
+
 RELATIVE_PATH_TO_FRONTEND = "/../../../../grid/frontend/"
 SCHEMA_FOLDER = "schema"
+
+GUEST_COMMANDS = """
+<li><span class='syft-code-block'>&lt;your_client&gt;.datasets</span> - list datasets</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.code</span> - list code</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.login</span> - list projects</li>
+"""
+
+DS_COMMANDS = """
+<li><span class='syft-code-block'>&lt;your_client&gt;.datasets</span> - list datasets</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.code</span> - list code</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.projects</span> - list projects</li>
+"""
+
+DO_COMMANDS = """
+<li><span class='syft-code-block'>&lt;your_client&gt;.projects</span> - list projects</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.requests</span> - list requests</li>
+<li><span class='syft-code-block'>&lt;your_client&gt;.users</span> - list users</li>
+"""
+
+DEFAULT_WELCOME_MSG = """
+        <style>
+            $FONT_CSS
+
+            .syft-container {
+                padding: 5px;
+                font-family: 'Open Sans';
+            }
+            .syft-alert-info {
+                color: #1F567A;
+                background-color: #C2DEF0;
+                border-radius: 4px;
+                padding: 5px;
+                padding: 13px 10px
+            }
+            .syft-code-block {
+                background-color: #f7f7f7;
+                border: 1px solid #cfcfcf;
+                padding: 0px 2px;
+            }
+            .syft-space {
+                margin-top: 1em;
+            }
+        </style>
+        <div class="syft-client syft-container">
+            <img src="$server_symbol" alt="Logo"
+            style="width:48px;height:48px;padding:3px;">
+            <h2>Welcome to $datasite_name</h2>
+            <div class="syft-space">
+            <strong>URL:</strong> $server_url <br />
+            <strong>Server Description:</strong> $description <br />
+            <strong>Server Type:</strong> $server_type <br />
+            <strong>Server Side Type:</strong>$server_side_type<br />
+            <strong>Syft Version:</strong> $server_version<br />
+
+            </div>
+            <div class='syft-alert-info syft-space'>
+                &#9432;&nbsp;
+                This datasite is run by the library PySyft to learn more about how it works visit
+                <a href="https://github.com/OpenMined/PySyft">github.com/OpenMined/PySyft</a>.
+            </div>
+            <h4>Commands to Get Started</h4>
+            $command_list
+        </div><br />
+        """
 
 # json schema primitive types
 primitive_mapping = {
@@ -28,8 +90,8 @@ primitive_mapping = {
 }
 
 
-def make_fake_type(_type_str: str):
-    jsonschema = {}
+def make_fake_type(_type_str: str) -> dict[str, Any]:
+    jsonschema: dict[str, Any] = {}
     jsonschema["title"] = _type_str
     jsonschema["type"] = "object"
     jsonschema["properties"] = {}
@@ -37,13 +99,13 @@ def make_fake_type(_type_str: str):
     return jsonschema
 
 
-def get_type_mapping(_type) -> str:
+def get_type_mapping(_type: type) -> str:
     if _type in primitive_mapping:
         return primitive_mapping[_type]
     return _type.__name__
 
 
-def get_types(cls: Type, keys: List[str]) -> Dict[str, Type]:
+def get_types(cls: type, keys: list[str]) -> dict[str, type] | None:
     types = []
     for key in keys:
         _type = None
@@ -61,8 +123,10 @@ def get_types(cls: Type, keys: List[str]) -> Dict[str, Type]:
     return dict(zip(keys, types))
 
 
-def convert_attribute_types(cls, attribute_list, attribute_types):
-    jsonschema = {}
+def convert_attribute_types(
+    cls: type, attribute_list: list[str], attribute_types: list[type]
+) -> dict[str, Any]:
+    jsonschema: dict[str, Any] = {}
     jsonschema["title"] = cls.__name__
     jsonschema["type"] = "object"
     jsonschema["properties"] = {}
@@ -75,11 +139,11 @@ def convert_attribute_types(cls, attribute_list, attribute_types):
     return jsonschema
 
 
-def process_type_bank(type_bank: Dict[str, Tuple[Any, ...]]) -> Dict[str, Dict]:
+def process_type_bank(type_bank: dict[str, tuple[Any, ...]]) -> dict[str, dict]:
     # first pass gets each type into basic json schema format
     json_mappings = {}
     count = 0
-    converted_types = defaultdict(int)
+    converted_types: dict[str, int] = defaultdict(int)
     for k in type_bank:
         count += 1
         t = type_bank[k]
@@ -116,10 +180,10 @@ def process_type_bank(type_bank: Dict[str, Tuple[Any, ...]]) -> Dict[str, Dict]:
     return json_mappings
 
 
-def resolve_references(json_mappings: Dict[str, Dict]) -> Dict[str, Dict]:
+def resolve_references(json_mappings: dict[str, dict]) -> dict[str, dict]:
     # track second pass generated types
     new_types = {}
-    for _, json_schema in json_mappings.items():
+    for json_schema in json_mappings.values():
         replace_types = {}
         for attribute, config in json_schema["properties"].items():
             if "type" in config:
@@ -149,7 +213,11 @@ def resolve_references(json_mappings: Dict[str, Dict]) -> Dict[str, Dict]:
     return json_mappings
 
 
-def generate_json_schemas(output_path: Optional[str] = None) -> None:
+@deprecated(
+    reason="generate_json_schemas is outdated, #1603 for more info",
+)
+def generate_json_schemas(output_path: str | None = None) -> None:
+    # TODO: should we also replace this with the SyftObjectRegistry?
     json_mappings = process_type_bank(sy.serde.recursive.TYPE_BANK)
     json_mappings = resolve_references(json_mappings)
     if not output_path:

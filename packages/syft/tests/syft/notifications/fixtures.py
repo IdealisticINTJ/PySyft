@@ -2,14 +2,17 @@
 import pytest
 
 # syft absolute
-from syft.node.credentials import SyftSigningKey
-from syft.node.credentials import SyftVerifyKey
-from syft.node.worker import Worker
+from syft.serde.serializable import serializable
+from syft.server.credentials import SyftSigningKey
+from syft.server.credentials import SyftVerifyKey
+from syft.server.worker import Worker
 from syft.service.context import AuthedServiceContext
+from syft.service.notification.email_templates import EmailTemplate
 from syft.service.notification.notification_service import NotificationService
 from syft.service.notification.notification_stash import NotificationStash
 from syft.service.notification.notifications import CreateNotification
 from syft.service.notification.notifications import Notification
+from syft.service.notifier.notifier_enums import NOTIFIERS
 from syft.service.user.user import User
 from syft.store.linked_obj import LinkedObject
 from syft.types.datetime import DateTime
@@ -22,32 +25,43 @@ test_verify_key_string = (
 test_verify_key = SyftVerifyKey.from_string(test_verify_key_string)
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def notification_stash(document_store):
-    return NotificationStash(store=document_store)
+    yield NotificationStash(store=document_store)
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def notification_service(document_store):
-    return NotificationService(store=document_store)
+    yield NotificationService(store=document_store)
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def authed_context(admin_user: User, worker: Worker) -> AuthedServiceContext:
-    return AuthedServiceContext(credentials=test_verify_key, node=worker)
+    yield AuthedServiceContext(credentials=test_verify_key, server=worker)
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def linked_object():
-    return LinkedObject(
-        node_uid=UID(),
+    yield LinkedObject(
+        server_uid=UID(),
         service_type=NotificationService,
         object_type=Notification,
         object_uid=UID(),
     )
 
 
-@pytest.fixture(autouse=True)
+@serializable(canonical_name="NewEmail", version=1)
+class NewEmail(EmailTemplate):
+    @staticmethod
+    def email_title(notification: "Notification", context) -> str:
+        return f"Welcome to {context.server.name} server!"
+
+    @staticmethod
+    def email_body(notification: "Notification", context) -> str:
+        return "x"
+
+
+@pytest.fixture
 def mock_create_notification(faker) -> CreateNotification:
     test_signing_key1 = SyftSigningKey.generate()
     test_verify_key1 = test_signing_key1.verify_key
@@ -57,23 +71,25 @@ def mock_create_notification(faker) -> CreateNotification:
     mock_notification = CreateNotification(
         subject="mock_created_notification",
         id=UID(),
-        node_uid=UID(),
+        server_uid=UID(),
+        notifier_types=[NOTIFIERS.EMAIL],
         from_user_verify_key=test_verify_key1,
         to_user_verify_key=test_verify_key2,
         created_at=DateTime.now(),
+        email_template=NewEmail,
     )
 
-    return mock_notification
+    yield mock_notification
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def mock_notification(
     root_verify_key,
     notification_stash: NotificationStash,
 ) -> Notification:
     mock_notification = Notification(
         subject="mock_notification",
-        node_uid=UID(),
+        server_uid=UID(),
         from_user_verify_key=SyftSigningKey.generate().verify_key,
         to_user_verify_key=SyftSigningKey.generate().verify_key,
         created_at=DateTime.now(),
@@ -82,4 +98,4 @@ def mock_notification(
     result = notification_stash.set(root_verify_key, mock_notification)
     assert result.is_ok()
 
-    return mock_notification
+    yield mock_notification

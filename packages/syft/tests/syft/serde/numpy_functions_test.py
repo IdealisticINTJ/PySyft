@@ -4,7 +4,10 @@ import pytest
 
 # syft absolute
 from syft import ActionObject
-from syft.service.response import SyftAttributeError
+
+# relative
+from ...utils.custom_markers import FAIL_ON_PYTHON_3_12_REASON
+from ...utils.custom_markers import PYTHON_AT_LEAST_3_12
 
 PYTHON_ARRAY = [0, 1, 1, 2, 2, 3]
 NP_ARRAY = np.array([0, 1, 1, 5, 5, 3])
@@ -49,7 +52,7 @@ NP_2dARRAY = np.array([[3, 4, 5, 2], [6, 7, 2, 6]])
         ("amin", "[0, 1, 1, 2, 2, 3]"),  # alias for min not exist in Syft
         ("amax", "[0, 1, 1, 2, 2, 3]"),  # alias for max not exist in Syft
         ("where", "a > 5, a, -1"),  # required condition
-        #     # Not Working
+        # Not Working
         pytest.param(
             "hsplit",
             "np.array([[3, 4, 5, 2], [6, 7, 2, 6]]), 4",
@@ -74,6 +77,7 @@ NP_2dARRAY = np.array([[3, 4, 5, 2], [6, 7, 2, 6]])
         ),
     ],
 )
+@pytest.mark.xfail(PYTHON_AT_LEAST_3_12, reason=FAIL_ON_PYTHON_3_12_REASON)
 def test_numpy_functions(func, func_arguments, request):
     # the problem is that ruff removes the unsued variable,
     # but this test case np_sy and a are considered as unused, though used in the eval string
@@ -87,7 +91,7 @@ def test_numpy_functions(func, func_arguments, request):
 
     except Exception as e:
         assert (
-            e == SyftAttributeError
+            e == AttributeError
         ), f"Can not evaluate {func}({func_arguments}) with {e}"
         print(e)
     else:

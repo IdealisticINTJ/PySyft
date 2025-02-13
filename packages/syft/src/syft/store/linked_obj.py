@@ -1,8 +1,6 @@
 # stdlib
+import logging
 from typing import Any
-from typing import Optional
-from typing import Type
-from typing import Union
 
 # third party
 from typing_extensions import Self
@@ -11,12 +9,15 @@ from typing_extensions import Self
 from ..serde.serializable import serializable
 from ..service.context import AuthedServiceContext
 from ..service.context import ChangeContext
-from ..service.context import NodeServiceContext
-from ..service.response import SyftError
+from ..service.context import ServerServiceContext
 from ..service.response import SyftSuccess
+from ..types.errors import SyftException
+from ..types.result import as_result
 from ..types.syft_object import SYFT_OBJECT_VERSION_1
 from ..types.syft_object import SyftObject
 from ..types.uid import UID
+
+logger = logging.getLogger(__name__)
 
 
 @serializable()
@@ -24,54 +25,89 @@ class LinkedObject(SyftObject):
     __canonical_name__ = "LinkedObject"
     __version__ = SYFT_OBJECT_VERSION_1
 
-    node_uid: UID
-    service_type: Type[Any]
-    object_type: Type[SyftObject]
+    server_uid: UID
+    service_type: type[Any]
+    object_type: type[SyftObject]
     object_uid: UID
+
+    _resolve_cache: SyftObject | None = None
+
+    __exclude_sync_diff_attrs__ = ["server_uid"]
 
     def __str__(self) -> str:
         resolved_obj_type = (
             type(self.resolve) if self.object_type is None else self.object_type
         )
-        return f"{resolved_obj_type.__name__}: {self.object_uid} @ Node {self.node_uid}"
+        return f"{resolved_obj_type.__name__}: {self.object_uid} @ Server {self.server_uid}"
 
     @property
     def resolve(self) -> SyftObject:
-        # relative
-        from ..client.api import APIRegistry
+        return self._resolve()
 
-        api = APIRegistry.api_for(
-            node_uid=self.node_uid,
-            user_verify_key=self.syft_client_verify_key,
-        )
-        return api.services.notifications.resolve_object(self)
+    def _resolve(self, load_cached: bool = False) -> SyftObject:
+        api = None
+        if load_cached and self._resolve_cache is not None:
+            return self._resolve_cache
+        try:
+            # relative
+            api = self.get_api()  # raises
+            resolve: SyftObject = api.services.notifications.resolve_object(self)
+            self._resolve_cache = resolve
+            return resolve
+        except Exception as e:
+            logger.error(">>> Failed to resolve object", type(api), e)
+            raise e
 
-    def resolve_with_context(self, context: NodeServiceContext) -> Any:
-        return context.node.get_service(self.service_type).resolve_link(
-            context=context, linked_obj=self
+    def resolve_dynamic(
+        self, context: ServerServiceContext | None, load_cached: bool = False
+    ) -> SyftObject:
+        if context is not None:
+            return self.resolve_with_context(context, load_cached).unwrap()
+        else:
+            return self._resolve(load_cached)
+
+    @as_result(SyftException)
+    def resolve_with_context(
+        self, context: ServerServiceContext, load_cached: bool = False
+    ) -> Any:
+        if load_cached and self._resolve_cache is not None:
+            return self._resolve_cache
+        if context.server is None:
+            raise ValueError(f"context {context}'s server is None")
+        res = (
+            context.server.get_service(self.service_type)
+            .resolve_link(context=context, linked_obj=self)
+            .unwrap()
         )
+        self._resolve_cache = res
+        return res
 
     def update_with_context(
-        self, context: NodeServiceContext, obj: Any
-    ) -> Union[SyftSuccess, SyftError]:
+        self, context: ServerServiceContext | ChangeContext | Any, obj: Any
+    ) -> SyftSuccess:
         if isinstance(context, AuthedServiceContext):
             credentials = context.credentials
         elif isinstance(context, ChangeContext):
             credentials = context.approving_user_credentials
         else:
-            return SyftError(message="wrong context passed")
-        result = context.node.get_service(self.service_type).stash.update(
-            credentials, obj
-        )
-        if result.is_ok():
-            return result
+            raise SyftException(public_message="wrong context passed")
+        if context.server is None:
+            raise SyftException(public_message=f"context {context}'s server is None")
+        service = context.server.get_service(self.service_type)
+        if hasattr(service, "stash"):
+            result = service.stash.update(credentials, obj).unwrap()
+        else:
+            raise SyftException(
+                public_message=f"service {service} does not have a stash"
+            )
+        return result
 
     @classmethod
     def from_obj(
         cls,
-        obj: SyftObject,
-        service_type: Optional[Type[Any]] = None,
-        node_uid: Optional[UID] = None,
+        obj: SyftObject | type[SyftObject],
+        service_type: type[Any] | None = None,
+        server_uid: UID | None = None,
     ) -> Self:
         if service_type is None:
             # relative
@@ -88,13 +124,13 @@ class LinkedObject(SyftObject):
         if object_uid is None:
             raise Exception(f"{cls} Requires an object UID")
 
-        if node_uid is None:
-            node_uid = getattr(obj, "node_uid", None)
-            if node_uid is None:
+        if server_uid is None:
+            server_uid = getattr(obj, "server_uid", None)
+            if server_uid is None:
                 raise Exception(f"{cls} Requires an object UID")
 
         return LinkedObject(
-            node_uid=node_uid,
+            server_uid=server_uid,
             service_type=service_type,
             object_type=type(obj),
             object_uid=object_uid,
@@ -105,9 +141,9 @@ class LinkedObject(SyftObject):
     def with_context(
         cls,
         obj: SyftObject,
-        context: NodeServiceContext,
-        object_uid: Optional[UID] = None,
-        service_type: Optional[Type[Any]] = None,
+        context: ServerServiceContext,
+        object_uid: UID | None = None,
+        service_type: type[Any] | None = None,
     ) -> Self:
         if service_type is None:
             # relative
@@ -120,24 +156,27 @@ class LinkedObject(SyftObject):
         if object_uid is None:
             raise Exception(f"{cls} Requires an object UID")
 
-        node_uid = context.node.id
+        if context.server is None:
+            raise ValueError(f"context {context}'s server is None")
+        server_uid = context.server.id
 
         return LinkedObject(
-            node_uid=node_uid,
+            server_uid=server_uid,
             service_type=service_type,
             object_type=type(obj),
             object_uid=object_uid,
         )
 
-    @staticmethod
+    @classmethod
     def from_uid(
+        cls,
         object_uid: UID,
-        object_type: Type[SyftObject],
-        service_type: Type[Any],
-        node_uid: UID,
+        object_type: type[SyftObject],
+        service_type: type[Any],
+        server_uid: UID,
     ) -> Self:
-        return LinkedObject(
-            node_uid=node_uid,
+        return cls(
+            server_uid=server_uid,
             service_type=service_type,
             object_type=object_type,
             object_uid=object_uid,

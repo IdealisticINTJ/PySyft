@@ -4,13 +4,16 @@ from typing import Any
 # relative
 from ..types.syft_object import SYFT_OBJECT_VERSION_1
 from ..types.syft_object import SyftObject
+from ..types.uid import UID
 
 
-class NodeConnection(SyftObject):
-    __canonical_name__ = "NodeConnection"
+class ServerConnection(SyftObject):
+    __canonical_name__ = "ServerConnection"
     __version__ = SYFT_OBJECT_VERSION_1
 
-    def get_cache_key() -> str:
+    id: UID | None = None  # type: ignore
+
+    def get_cache_key(self) -> str:
         raise NotImplementedError
 
     def __repr__(self) -> str:

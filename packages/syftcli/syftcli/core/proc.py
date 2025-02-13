@@ -1,4 +1,5 @@
 # stdlib
+from collections.abc import Callable
 from functools import wraps
 from subprocess import CalledProcessError
 from subprocess import CompletedProcess
@@ -6,8 +7,6 @@ from subprocess import PIPE
 from subprocess import Popen
 import threading
 from typing import Any
-from typing import Callable
-from typing import Optional
 
 __all__ = ["run_command", "check_returncode", "CalledProcessError", "CompletedProcess"]
 
@@ -18,10 +17,10 @@ def NOOP(x: Any) -> None:
 
 def run_command(
     command: str,
-    working_dir: Optional[str] = None,
+    working_dir: str | None = None,
     stdout: int = PIPE,
     stderr: int = PIPE,
-    stream_output: Optional[dict] = None,
+    stream_output: dict | None = None,
     dryrun: bool = False,
 ) -> CompletedProcess:
     """
@@ -101,7 +100,7 @@ def run_command(
 
 
 def check_returncode(
-    func: Callable[..., CompletedProcess]
+    func: Callable[..., CompletedProcess],
 ) -> Callable[..., CompletedProcess]:
     """A decorator to wrap run_command and check the return code."""
 

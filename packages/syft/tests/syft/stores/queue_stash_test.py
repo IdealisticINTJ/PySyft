@@ -1,570 +1,286 @@
 # stdlib
-import sys
-from threading import Thread
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 # third party
-from joblib import Parallel
-from joblib import delayed
 import pytest
 
-# relative
-from .store_fixtures_test import mongo_queue_stash_fn
-from .store_fixtures_test import sqlite_queue_stash_fn
-from .store_mocks_test import MockSyftObject
+# syft absolute
+from syft.service.queue.queue_stash import QueueItem
+from syft.service.queue.queue_stash import QueueStash
+from syft.service.worker.worker_pool import WorkerPool
+from syft.service.worker.worker_pool_service import SyftWorkerPoolService
+from syft.store.linked_obj import LinkedObject
+from syft.types.errors import SyftException
+from syft.types.uid import UID
 
-REPEATS = 20
+
+def mock_queue_object() -> QueueItem:
+    worker_pool_obj = WorkerPool(
+        name="mypool",
+        image_id=UID(),
+        max_count=0,
+        worker_list=[],
+    )
+    linked_worker_pool = LinkedObject.from_obj(
+        worker_pool_obj,
+        server_uid=UID(),
+        service_type=SyftWorkerPoolService,
+    )
+    obj = QueueItem(
+        id=UID(),
+        server_uid=UID(),
+        method="dummy_method",
+        service="dummy_service",
+        args=[],
+        kwargs={},
+        worker_pool=linked_worker_pool,
+    )
+    return obj
 
 
 @pytest.mark.parametrize(
     "queue",
     [
-        pytest.lazy_fixture("dict_queue_stash"),
-        pytest.lazy_fixture("sqlite_queue_stash"),
-        pytest.lazy_fixture("mongo_queue_stash"),
+        pytest.lazy_fixture("queue_stash"),
     ],
 )
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="pytest_mock_resources + docker issues on Windows and OSX",
-)
-def test_queue_stash_sanity(queue: Any) -> None:
+def test_queue_stash_sanity(queue: QueueStash) -> None:
     assert len(queue) == 0
-    assert hasattr(queue, "store")
-    assert hasattr(queue, "partition")
 
 
 @pytest.mark.parametrize(
     "queue",
     [
-        pytest.lazy_fixture("dict_queue_stash"),
-        pytest.lazy_fixture("sqlite_queue_stash"),
-        pytest.lazy_fixture("mongo_queue_stash"),
+        pytest.lazy_fixture("queue_stash"),
     ],
 )
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="pytest_mock_resources + docker issues on Windows and OSX",
-)
-@pytest.mark.flaky(reruns=5, reruns_delay=2)
-def test_queue_stash_set_get(root_verify_key, queue: Any) -> None:
-    objs = []
-    for idx in range(REPEATS):
-        obj = MockSyftObject(data=idx)
+#
+def test_queue_stash_set_get(root_verify_key, queue: QueueStash) -> None:
+    objs: list[QueueItem] = []
+    repeats = 5
+    for idx in range(repeats):
+        obj = mock_queue_object()
         objs.append(obj)
 
-        res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-        assert res.is_ok()
+        queue.set(root_verify_key, obj, ignore_duplicates=False).unwrap()
         assert len(queue) == idx + 1
 
-        res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-        assert res.is_err()
+        with pytest.raises(SyftException):
+            queue.set(root_verify_key, obj, ignore_duplicates=False).unwrap()
         assert len(queue) == idx + 1
 
         assert len(queue.get_all(root_verify_key).ok()) == idx + 1
 
-        item = queue.find_one(root_verify_key, id=obj.id)
-        assert item.is_ok()
-        assert item.ok() == obj
+        item = queue.get_by_uid(root_verify_key, uid=obj.id).unwrap()
+        assert item == obj
 
     cnt = len(objs)
     for obj in objs:
-        res = queue.find_and_delete(root_verify_key, id=obj.id)
-        assert res.is_ok()
-
+        queue.delete_by_uid(root_verify_key, uid=obj.id).unwrap()
         cnt -= 1
         assert len(queue) == cnt
-        item = queue.find_one(root_verify_key, id=obj.id)
-        assert item.is_ok()
-        assert item.ok() is None
+        item = queue.get_by_uid(root_verify_key, uid=obj.id)
+        assert item.is_err()
 
 
 @pytest.mark.parametrize(
     "queue",
     [
-        pytest.lazy_fixture("dict_queue_stash"),
-        pytest.lazy_fixture("sqlite_queue_stash"),
-        pytest.lazy_fixture("mongo_queue_stash"),
+        pytest.lazy_fixture("queue_stash"),
     ],
 )
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="pytest_mock_resources + docker issues on Windows or OSX",
-)
-@pytest.mark.flaky(reruns=5, reruns_delay=2)
-def test_queue_stash_update(root_verify_key, queue: Any) -> None:
-    obj = MockSyftObject(data=0)
-    res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-    assert res.is_ok()
+def test_queue_stash_update(queue: QueueStash) -> None:
+    root_verify_key = queue.db.root_verify_key
+    obj = mock_queue_object()
+    queue.set(root_verify_key, obj, ignore_duplicates=False).unwrap()
+    repeats = 5
 
-    for idx in range(REPEATS):
-        obj.data = idx
+    for idx in range(repeats):
+        obj.args = [idx]
 
-        res = queue.update(root_verify_key, obj)
-        assert res.is_ok()
+        queue.update(root_verify_key, obj).unwrap()
         assert len(queue) == 1
 
-        item = queue.find_one(root_verify_key, id=obj.id)
-        assert item.is_ok()
-        assert item.ok().data == idx
+        item = queue.get_by_uid(root_verify_key, uid=obj.id).unwrap()
+        assert item.args == [idx]
 
-    res = queue.find_and_delete(root_verify_key, id=obj.id)
-    assert res.is_ok()
+    queue.delete_by_uid(root_verify_key, uid=obj.id).unwrap()
     assert len(queue) == 0
 
 
 @pytest.mark.parametrize(
     "queue",
     [
-        pytest.lazy_fixture("dict_queue_stash"),
-        pytest.lazy_fixture("sqlite_queue_stash"),
-        pytest.lazy_fixture("mongo_queue_stash"),
+        pytest.lazy_fixture("queue_stash"),
     ],
 )
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="pytest_mock_resources + docker issues on Windows or OSX",
-)
-@pytest.mark.flaky(reruns=5, reruns_delay=2)
-@pytest.mark.xfail
-def test_queue_set_existing_queue_threading(root_verify_key, queue: Any) -> None:
-    thread_cnt = 3
-    repeats = REPEATS
-
-    execution_err = None
-
-    def _kv_cbk(tid: int) -> None:
-        nonlocal execution_err
-        for idx in range(repeats):
-            obj = MockSyftObject(data=idx)
-
-            for _ in range(10):
-                res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                execution_err = res
-            assert res.is_ok()
-
-    tids = []
-    for tid in range(thread_cnt):
-        thread = Thread(target=_kv_cbk, args=(tid,))
-        thread.start()
-
-        tids.append(thread)
-
-    for thread in tids:
-        thread.join()
-
-    assert execution_err is None
-    assert len(queue) == thread_cnt * repeats
+def test_queue_set_existing_queue_threading(root_verify_key, queue: QueueStash) -> None:
+    root_verify_key = queue.db.root_verify_key
+    items_to_create = 100
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = list(
+            executor.map(
+                lambda obj: queue.set(
+                    root_verify_key,
+                    mock_queue_object(),
+                ),
+                range(items_to_create),
+            )
+        )
+        assert all(res.is_ok() for res in results), "Error occurred during execution"
+    assert len(queue) == items_to_create
 
 
 @pytest.mark.parametrize(
     "queue",
     [
-        pytest.lazy_fixture("dict_queue_stash"),
-        pytest.lazy_fixture("sqlite_queue_stash"),
-        pytest.lazy_fixture("mongo_queue_stash"),
+        pytest.lazy_fixture("queue_stash"),
     ],
 )
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="pytest_mock_resources + docker issues on Windows or OSX",
-)
-@pytest.mark.flaky(reruns=5, reruns_delay=2)
-def test_queue_update_existing_queue_threading(root_verify_key, queue: Any) -> None:
-    thread_cnt = 3
-    repeats = REPEATS
+def test_queue_update_existing_queue_threading(queue: QueueStash) -> None:
+    root_verify_key = queue.db.root_verify_key
+    obj = mock_queue_object()
 
-    obj = MockSyftObject(data=0)
+    def update_queue():
+        obj.args = [UID()]
+        res = queue.update(root_verify_key, obj)
+        return res
+
     queue.set(root_verify_key, obj, ignore_duplicates=False)
-    execution_err = None
 
-    def _kv_cbk(tid: int) -> None:
-        nonlocal execution_err
-        for repeat in range(repeats):
-            obj.data = repeat
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        # Run the update_queue function in multiple threads
+        results = list(
+            executor.map(
+                lambda _: update_queue(),
+                range(5),
+            )
+        )
+        assert all(res.is_ok() for res in results), "Error occurred during execution"
 
-            for _ in range(10):
-                res = queue.update(root_verify_key, obj)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                execution_err = res
-            assert res.is_ok()
-
-    tids = []
-    for tid in range(thread_cnt):
-        thread = Thread(target=_kv_cbk, args=(tid,))
-        thread.start()
-
-        tids.append(thread)
-
-    for thread in tids:
-        thread.join()
-
-    assert execution_err is None
+    assert len(queue) == 1
+    item = queue.get_by_uid(root_verify_key, uid=obj.id).unwrap()
+    assert item.args != []
 
 
 @pytest.mark.parametrize(
     "queue",
     [
-        pytest.lazy_fixture("dict_queue_stash"),
-        pytest.lazy_fixture("sqlite_queue_stash"),
-        pytest.lazy_fixture("mongo_queue_stash"),
+        pytest.lazy_fixture("queue_stash"),
     ],
 )
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="pytest_mock_resources + docker issues on Windows or OSX",
-)
-@pytest.mark.flaky(reruns=10, reruns_delay=2)
 def test_queue_set_delete_existing_queue_threading(
-    root_verify_key,
-    queue: Any,
+    queue: QueueStash,
 ) -> None:
-    thread_cnt = 3
-    repeats = REPEATS
-
-    execution_err = None
-    objs = []
-
-    for idx in range(repeats * thread_cnt):
-        obj = MockSyftObject(data=idx)
-        res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-        objs.append(obj)
-
-        assert res.is_ok()
-
-    def _kv_cbk(tid: int) -> None:
-        nonlocal execution_err
-        for idx in range(repeats):
-            item_idx = tid * repeats + idx
-
-            for _ in range(10):
-                res = queue.find_and_delete(root_verify_key, id=objs[item_idx].id)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                execution_err = res
-            assert res.is_ok()
-
-    tids = []
-    for tid in range(thread_cnt):
-        thread = Thread(target=_kv_cbk, args=(tid,))
-        thread.start()
-
-        tids.append(thread)
-
-    for thread in tids:
-        thread.join()
-
-    assert execution_err is None
-    assert len(queue) == 0
-
-
-def helper_queue_set_threading(root_verify_key, create_queue_cbk) -> None:
-    thread_cnt = 3
-    repeats = REPEATS
-
-    execution_err = None
-
-    def _kv_cbk(tid: int) -> None:
-        nonlocal execution_err
-        queue = create_queue_cbk()
-
-        for idx in range(repeats):
-            obj = MockSyftObject(data=idx)
-
-            for _ in range(10):
-                res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                execution_err = res
-            assert res.is_ok()
-
-    tids = []
-    for tid in range(thread_cnt):
-        thread = Thread(target=_kv_cbk, args=(tid,))
-        thread.start()
-
-        tids.append(thread)
-
-    for thread in tids:
-        thread.join()
-
-    queue = create_queue_cbk()
-
-    assert execution_err is None
-    assert len(queue) == thread_cnt * repeats
-
-
-def helper_queue_set_joblib(root_verify_key, create_queue_cbk) -> None:
-    thread_cnt = 3
-    repeats = 10
-
-    def _kv_cbk(tid: int) -> None:
-        queue = create_queue_cbk()
-
-        for idx in range(repeats):
-            obj = MockSyftObject(data=idx)
-
-            for _ in range(10):
-                res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                return res
-        return None
-
-    errs = Parallel(n_jobs=thread_cnt)(
-        delayed(_kv_cbk)(idx) for idx in range(thread_cnt)
-    )
-
-    for execution_err in errs:
-        assert execution_err is None
-
-    queue = create_queue_cbk()
-    assert len(queue) == thread_cnt * repeats
-
-
-@pytest.mark.parametrize(
-    "backend", [helper_queue_set_threading, helper_queue_set_joblib]
-)
-@pytest.mark.flaky(reruns=3, reruns_delay=1)
-def test_queue_set_sqlite(root_verify_key, sqlite_workspace, backend):
-    def create_queue_cbk():
-        return sqlite_queue_stash_fn(root_verify_key, sqlite_workspace)
-
-    backend(root_verify_key, create_queue_cbk)
-
-
-@pytest.mark.xfail(
-    reason="MongoDocumentStore is not serializable, but the same instance is needed for the partitions"
-)
-@pytest.mark.parametrize(
-    "backend", [helper_queue_set_threading, helper_queue_set_joblib]
-)
-@pytest.mark.flaky(reruns=5, reruns_delay=2)
-def test_queue_set_threading_mongo(mongo_document_store, backend):
-    def create_queue_cbk():
-        return mongo_queue_stash_fn(mongo_document_store)
-
-    backend(create_queue_cbk)
-
-
-def helper_queue_update_threading(root_verify_key, create_queue_cbk) -> None:
-    thread_cnt = 3
-    repeats = REPEATS
-
-    queue = create_queue_cbk()
-
-    obj = MockSyftObject(data=0)
-    queue.set(root_verify_key, obj, ignore_duplicates=False)
-    execution_err = None
-
-    def _kv_cbk(tid: int) -> None:
-        nonlocal execution_err
-        queue_local = create_queue_cbk()
-
-        for repeat in range(repeats):
-            obj.data = repeat
-
-            for _ in range(10):
-                res = queue_local.update(root_verify_key, obj)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                execution_err = res
-            assert res.is_ok()
-
-    tids = []
-    for tid in range(thread_cnt):
-        thread = Thread(target=_kv_cbk, args=(tid,))
-        thread.start()
-
-        tids.append(thread)
-
-    for thread in tids:
-        thread.join()
-
-    assert execution_err is None
-
-
-def helper_queue_update_joblib(root_verify_key, create_queue_cbk) -> None:
-    thread_cnt = 3
-    repeats = REPEATS
-
-    def _kv_cbk(tid: int) -> None:
-        queue_local = create_queue_cbk()
-
-        for repeat in range(repeats):
-            obj.data = repeat
-
-            for _ in range(10):
-                res = queue_local.update(root_verify_key, obj)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                return res
-        return None
-
-    queue = create_queue_cbk()
-
-    obj = MockSyftObject(data=0)
-    queue.set(root_verify_key, obj, ignore_duplicates=False)
-
-    errs = Parallel(n_jobs=thread_cnt)(
-        delayed(_kv_cbk)(idx) for idx in range(thread_cnt)
-    )
-    for execution_err in errs:
-        assert execution_err is None
-
-
-@pytest.mark.parametrize(
-    "backend", [helper_queue_update_threading, helper_queue_update_joblib]
-)
-@pytest.mark.flaky(reruns=3, reruns_delay=1)
-def test_queue_update_threading_sqlite(root_verify_key, sqlite_workspace, backend):
-    def create_queue_cbk():
-        return sqlite_queue_stash_fn(root_verify_key, sqlite_workspace)
-
-    backend(root_verify_key, create_queue_cbk)
-
-
-@pytest.mark.xfail(
-    reason="MongoDocumentStore is not serializable, but the same instance is needed for the partitions"
-)
-@pytest.mark.parametrize(
-    "backend", [helper_queue_update_threading, helper_queue_update_joblib]
-)
-@pytest.mark.flaky(reruns=5, reruns_delay=2)
-def test_queue_update_threading_mongo(mongo_document_store, backend):
-    def create_queue_cbk():
-        return mongo_queue_stash_fn(mongo_document_store)
-
-    backend(create_queue_cbk)
-
-
-def helper_queue_set_delete_threading(
-    root_verify_key,
-    create_queue_cbk,
-) -> None:
-    thread_cnt = 3
-    repeats = REPEATS
-
-    queue = create_queue_cbk()
-    execution_err = None
-    objs = []
-
-    for idx in range(repeats * thread_cnt):
-        obj = MockSyftObject(data=idx)
-        res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-        objs.append(obj)
-
-        assert res.is_ok()
-
-    def _kv_cbk(tid: int) -> None:
-        nonlocal execution_err
-        queue = create_queue_cbk()
-        for idx in range(repeats):
-            item_idx = tid * repeats + idx
-
-            for _ in range(10):
-                res = queue.find_and_delete(root_verify_key, id=objs[item_idx].id)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                execution_err = res
-            assert res.is_ok()
-
-    tids = []
-    for tid in range(thread_cnt):
-        thread = Thread(target=_kv_cbk, args=(tid,))
-        thread.start()
-
-        tids.append(thread)
-
-    for thread in tids:
-        thread.join()
-
-    assert execution_err is None
-    assert len(queue) == 0
-
-
-def helper_queue_set_delete_joblib(
-    root_verify_key,
-    create_queue_cbk,
-) -> None:
-    thread_cnt = 3
-    repeats = REPEATS
-
-    def _kv_cbk(tid: int) -> None:
-        nonlocal execution_err
-        queue = create_queue_cbk()
-        for idx in range(repeats):
-            item_idx = tid * repeats + idx
-
-            for _ in range(10):
-                res = queue.find_and_delete(root_verify_key, id=objs[item_idx].id)
-                if res.is_ok():
-                    break
-
-            if res.is_err():
-                execution_err = res
-            assert res.is_ok()
-
-    queue = create_queue_cbk()
-    execution_err = None
-    objs = []
-
-    for idx in range(repeats * thread_cnt):
-        obj = MockSyftObject(data=idx)
-        res = queue.set(root_verify_key, obj, ignore_duplicates=False)
-        objs.append(obj)
-
-        assert res.is_ok()
-
-    errs = Parallel(n_jobs=thread_cnt)(
-        delayed(_kv_cbk)(idx) for idx in range(thread_cnt)
-    )
-
-    for execution_err in errs:
-        assert execution_err is None
-
-    assert len(queue) == 0
-
-
-@pytest.mark.parametrize(
-    "backend", [helper_queue_set_delete_threading, helper_queue_set_delete_joblib]
-)
-@pytest.mark.flaky(reruns=3, reruns_delay=1)
-def test_queue_delete_threading_sqlite(root_verify_key, sqlite_workspace, backend):
-    def create_queue_cbk():
-        return sqlite_queue_stash_fn(root_verify_key, sqlite_workspace)
-
-    backend(root_verify_key, create_queue_cbk)
-
-
-@pytest.mark.xfail(
-    reason="MongoDocumentStore is not serializable, but the same instance is needed for the partitions"
-)
-@pytest.mark.parametrize(
-    "backend", [helper_queue_set_delete_threading, helper_queue_set_delete_joblib]
-)
-@pytest.mark.flaky(reruns=5, reruns_delay=2)
-def test_queue_delete_threading_mongo(mongo_document_store, backend):
-    def create_queue_cbk():
-        return mongo_queue_stash_fn(mongo_document_store)
-
-    backend(create_queue_cbk)
+    root_verify_key = queue.db.root_verify_key
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = list(
+            executor.map(
+                lambda obj: queue.set(
+                    root_verify_key,
+                    mock_queue_object(),
+                ),
+                range(15),
+            )
+        )
+        objs = [item.unwrap() for item in results]
+
+        results = list(
+            executor.map(
+                lambda obj: queue.delete_by_uid(root_verify_key, uid=obj.id),
+                objs,
+            )
+        )
+        assert all(res.is_ok() for res in results), "Error occurred during execution"
+
+
+def test_queue_set(queue_stash: QueueStash):
+    root_verify_key = queue_stash.db.root_verify_key
+    config = queue_stash.db.config
+    server_uid = queue_stash.db.server_uid
+
+    def set_in_new_thread(_):
+        queue_stash = QueueStash.random(
+            root_verify_key=root_verify_key,
+            config=config,
+            server_uid=server_uid,
+        )
+        return queue_stash.set(root_verify_key, mock_queue_object())
+
+    total_repeats = 50
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = list(
+            executor.map(
+                set_in_new_thread,
+                range(total_repeats),
+            )
+        )
+
+    assert all(res.is_ok() for res in results), "Error occurred during execution"
+    assert len(queue_stash) == total_repeats
+
+
+def test_queue_update_threading(queue_stash: QueueStash):
+    root_verify_key = queue_stash.db.root_verify_key
+    config = queue_stash.db.config
+    server_uid = queue_stash.db.server_uid
+    obj = mock_queue_object()
+    queue_stash.set(root_verify_key, obj).unwrap()
+
+    def update_in_new_thread(_):
+        queue_stash = QueueStash.random(
+            root_verify_key=root_verify_key,
+            config=config,
+            server_uid=server_uid,
+        )
+        obj.args = [UID()]
+        return queue_stash.update(root_verify_key, obj)
+
+    total_repeats = 50
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = list(
+            executor.map(
+                update_in_new_thread,
+                range(total_repeats),
+            )
+        )
+
+    assert all(res.is_ok() for res in results), "Error occurred during execution"
+    assert len(queue_stash) == 1
+
+
+def test_queue_delete_threading(queue_stash: QueueStash):
+    root_verify_key = queue_stash.db.root_verify_key
+    root_verify_key = queue_stash.db.root_verify_key
+    config = queue_stash.db.config
+    server_uid = queue_stash.db.server_uid
+
+    def delete_in_new_thread(obj: QueueItem):
+        queue_stash = QueueStash.random(
+            root_verify_key=root_verify_key,
+            config=config,
+            server_uid=server_uid,
+        )
+        return queue_stash.delete_by_uid(root_verify_key, uid=obj.id)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = list(
+            executor.map(
+                lambda obj: queue_stash.set(
+                    root_verify_key,
+                    mock_queue_object(),
+                ),
+                range(50),
+            )
+        )
+        objs = [item.unwrap() for item in results]
+
+        results = list(
+            executor.map(
+                delete_in_new_thread,
+                objs,
+            )
+        )
+        assert all(res.is_ok() for res in results), "Error occurred during execution"
+
+    assert len(queue_stash) == 0
