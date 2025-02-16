@@ -1,32 +1,32 @@
 # stdlib
+from secrets import token_hex
 from typing import Any
-from typing import Dict
 
 # third party
 from nacl.exceptions import BadSignatureError
 import numpy as np
 import pytest
-from result import Ok
 
 # syft absolute
 import syft as sy
 from syft.client.api import SignedSyftAPICall
 from syft.client.api import SyftAPICall
-from syft.node.credentials import SIGNING_KEY_FOR
-from syft.node.credentials import SyftSigningKey
-from syft.node.credentials import SyftVerifyKey
-from syft.node.worker import Worker
+from syft.server.credentials import SIGNING_KEY_FOR
+from syft.server.credentials import SyftSigningKey
+from syft.server.credentials import SyftVerifyKey
+from syft.server.worker import Worker
 from syft.service.action.action_object import ActionObject
-from syft.service.action.action_store import DictActionStore
+from syft.service.action.action_store import ActionObjectStash
 from syft.service.context import AuthedServiceContext
 from syft.service.queue.queue_stash import QueueItem
-from syft.service.response import SyftAttributeError
 from syft.service.response import SyftError
 from syft.service.user.user import User
 from syft.service.user.user import UserCreate
 from syft.service.user.user import UserView
-from syft.service.user.user_service import UserService
-from syft.types.uid import UID
+from syft.service.user.user_stash import UserStash
+from syft.store.db.sqlite import SQLiteDBManager
+from syft.types.errors import SyftException
+from syft.types.result import Ok
 
 test_signing_key_string = (
     "b7803e90a6f3f4330afbd943cef3451c716b338b17a9cf40a0a309bc38bc366d"
@@ -76,28 +76,42 @@ def test_signing_key() -> None:
     assert test_verify_key == test_verify_key_2
 
 
-def test_action_store() -> None:
+@pytest.fixture(
+    scope="function",
+    params=[
+        "tODOsqlite_address",
+        # "TODOpostgres_address", # will be used when we have a postgres CI tests
+    ],
+)
+def action_object_stash() -> ActionObjectStash:
+    root_verify_key = SyftVerifyKey.from_string(test_verify_key_string)
+    db_manager = SQLiteDBManager.random(root_verify_key=root_verify_key)
+    stash = ActionObjectStash(store=db_manager)
+    _ = UserStash(store=db_manager)
+    stash.db.init_tables()
+    yield stash
+
+
+def test_action_store(action_object_stash: ActionObjectStash) -> None:
     test_signing_key = SyftSigningKey.from_string(test_signing_key_string)
-    action_store = DictActionStore()
-    uid = UID()
+    test_verify_key = test_signing_key.verify_key
     raw_data = np.array([1, 2, 3])
     test_object = ActionObject.from_obj(raw_data)
+    uid = test_object.id
 
-    set_result = action_store.set(
+    action_object_stash.set_or_update(
         uid=uid,
-        credentials=test_signing_key,
+        credentials=test_verify_key,
         syft_object=test_object,
         has_result_read_permission=True,
-    )
-    assert set_result.is_ok()
-    test_object_result = action_store.get(uid=uid, credentials=test_signing_key)
-    assert test_object_result.is_ok()
-    assert (test_object == test_object_result.ok()).all()
+    ).unwrap()
+    from_stash = action_object_stash.get(uid=uid, credentials=test_verify_key).unwrap()
+    assert (test_object == from_stash).all()
 
     test_verift_key_2 = SyftVerifyKey.from_string(test_verify_key_string_2)
-    test_object_result_fail = action_store.get(uid=uid, credentials=test_verift_key_2)
-    assert test_object_result_fail.is_err()
-    assert "denied" in test_object_result_fail.err()
+    with pytest.raises(SyftException) as exc:
+        action_object_stash.get(uid=uid, credentials=test_verift_key_2).unwrap()
+        assert "denied" in exc.public_message
 
 
 def test_user_transform() -> None:
@@ -129,10 +143,9 @@ def test_user_transform() -> None:
     assert not hasattr(edit_user, "signing_key")
 
 
-def test_user_service() -> None:
+def test_user_service(worker) -> None:
     test_signing_key = SyftSigningKey.from_string(test_signing_key_string)
-    worker = Worker()
-    user_service = worker.get_service(UserService)
+    user_service = worker.services.user
 
     # create a user
     new_user = UserCreate(
@@ -143,10 +156,12 @@ def test_user_service() -> None:
     )
 
     # create a context
-    context = AuthedServiceContext(node=worker, credentials=test_signing_key.verify_key)
+    context = AuthedServiceContext(
+        server=worker, credentials=test_signing_key.verify_key
+    )
 
     # call the create function
-    user_view = user_service.create(context=context, user_create=new_user)
+    user_view = user_service.create(context=context, **new_user)
 
     # get the result
     assert user_view is not None
@@ -173,18 +188,16 @@ def test_syft_object_serde() -> None:
         password="letmein",
         password_verify="letmein",
     )
-    # syft absolute
-    import syft as sy
-
     ser = sy.serialize(new_user, to_bytes=True)
     de = sy.deserialize(ser, from_bytes=True)
 
     assert new_user == de
 
 
-def test_worker() -> None:
-    worker = Worker()
+def test_worker(worker) -> None:
     assert worker
+    assert worker.name
+    assert worker.id
 
 
 def test_action_object_add() -> None:
@@ -210,8 +223,8 @@ def test_action_object_hooks() -> None:
         # change return type to sum
         return Ok(sum(new_result))
 
-    action_object._syft_pre_hooks__["__add__"] = [pre_add]
-    action_object._syft_post_hooks__["__add__"] = [post_add]
+    action_object.syft_pre_hooks__["__add__"] = [pre_add]
+    action_object.syft_post_hooks__["__add__"] = [post_add]
 
     result = action_object + action_object
     x = result.syft_action_data
@@ -219,103 +232,94 @@ def test_action_object_hooks() -> None:
     assert y == 18
     assert x == y
 
-    action_object._syft_pre_hooks__["__add__"] = []
-    action_object._syft_post_hooks__["__add__"] = []
+    action_object.syft_pre_hooks__["__add__"] = []
+    action_object.syft_post_hooks__["__add__"] = []
 
 
-def test_worker_serde() -> None:
-    worker = Worker()
-    ser = sy.serialize(worker, to_bytes=True)
-    de = sy.deserialize(ser, from_bytes=True)
-
-    assert de.signing_key == worker.signing_key
-    assert de.id == worker.id
+@pytest.fixture(params=[0])
+def worker_with_proc(request):
+    worker = Worker(
+        name=token_hex(8),
+        processes=request.param,
+        signing_key=SyftSigningKey.from_string(test_signing_key_string),
+    )
+    yield worker
+    worker.cleanup()
 
 
 @pytest.mark.parametrize(
     "path, kwargs",
     [
         ("data_subject.get_all", {}),
-        ("data_subject.get_by_name", {"name": "test"}),
+        ("user.get_all", {}),
         ("dataset.get_all", {}),
         ("dataset.search", {"name": "test"}),
         ("metadata", {}),
     ],
 )
 @pytest.mark.parametrize("blocking", [False, True])
-@pytest.mark.parametrize("n_processes", [0])
 def test_worker_handle_api_request(
-    path: str, kwargs: Dict, blocking: bool, n_processes: int
+    worker_with_proc,
+    path: str,
+    kwargs: dict,
+    blocking: bool,
 ) -> None:
-    node_uid = UID()
-    test_signing_key = SyftSigningKey.from_string(test_signing_key_string)
-
-    worker = Worker(
-        name="test-domain-1",
-        processes=n_processes,
-        id=node_uid,
-        signing_key=test_signing_key,
-    )
-    root_client = worker.root_client
+    print(f"run: blocking: {blocking} path: {path} kwargs: {kwargs}")
+    server_uid = worker_with_proc.id
+    root_client = worker_with_proc.root_client
     assert root_client.api is not None
 
     root_client.guest()
 
     # TODO: 🟡 Fix: root_client.guest is overriding root_client.
-    root_client = worker.root_client
+    root_client = worker_with_proc.root_client
 
     api_call = SyftAPICall(
-        node_uid=node_uid, path=path, args=[], kwargs=kwargs, blocking=blocking
+        server_uid=server_uid, path=path, args=[], kwargs=kwargs, blocking=blocking
     )
     # should fail on unsigned requests
-    result = worker.handle_api_call(api_call).message.data
-    assert isinstance(result, SyftError)
+    with pytest.raises(SyftException):
+        _ = worker_with_proc.handle_api_call(api_call).message.data
 
     signed_api_call = api_call.sign(root_client.api.signing_key)
 
     # should work on signed api calls
-    result = worker.handle_api_call(signed_api_call).message.data
-    assert not isinstance(result, SyftError)
+    _ = worker_with_proc.handle_api_call(signed_api_call).message.data
 
     # Guest client should not have access to the APIs
     guest_signed_api_call = api_call.sign(root_client.api.signing_key)
-    result = worker.handle_api_call(guest_signed_api_call).message
-    assert not isinstance(result, SyftAttributeError)
+    _ = worker_with_proc.handle_api_call(guest_signed_api_call).message
 
     # should fail on altered requests
     bogus_api_call = signed_api_call
     bogus_api_call.serialized_message += b"hacked"
 
-    result = worker.handle_api_call(bogus_api_call).message.data
-    assert isinstance(result, SyftError)
+    with pytest.raises(SyftException):
+        _ = worker_with_proc.handle_api_call(bogus_api_call).message.data
 
 
 @pytest.mark.parametrize(
     "path, kwargs",
     [
         ("data_subject.get_all", {}),
-        ("data_subject.get_by_name", {"name": "test"}),
+        ("user.get_all", {}),
         ("dataset.get_all", {}),
         ("dataset.search", {"name": "test"}),
         ("metadata", {}),
     ],
 )
 @pytest.mark.parametrize("blocking", [False, True])
-# @pytest.mark.parametrize("n_processes", [0, 1])
-@pytest.mark.parametrize("n_processes", [0])
 def test_worker_handle_api_response(
-    path: str, kwargs: Dict, blocking: bool, n_processes: int
+    worker_with_proc: Worker,
+    path: str,
+    kwargs: dict,
+    blocking: bool,
 ) -> None:
-    test_signing_key = SyftSigningKey.from_string(test_signing_key_string)
+    server_uid = worker_with_proc.id
+    n_processes = worker_with_proc.processes
+    root_client = worker_with_proc.root_client
 
-    node_uid = UID()
-    worker = Worker(
-        name="test-domain-1",
-        processes=n_processes,
-        id=node_uid,
-        signing_key=test_signing_key,
-    )
-    root_client = worker.root_client
+    assert root_client.settings.allow_guest_signup(enable=True)
     assert root_client.api is not None
 
     guest_client = root_client.guest()
@@ -328,19 +332,19 @@ def test_worker_handle_api_response(
     )
 
     # TODO: 🟡 Fix: root_client.guest is overriding root_client.
-    root_client = worker.root_client
+    root_client = worker_with_proc.root_client
 
     call = SyftAPICall(
-        node_uid=node_uid, path=path, args=[], kwargs=kwargs, blocking=blocking
+        server_uid=server_uid, path=path, args=[], kwargs=kwargs, blocking=blocking
     )
     signed_api_call = call.sign(root_client.credentials)
 
     # handle_api_call_with_unsigned_result should returned an unsigned result
-    us_result = worker.handle_api_call_with_unsigned_result(signed_api_call)
+    us_result = worker_with_proc.handle_api_call_with_unsigned_result(signed_api_call)
     assert not isinstance(us_result, SignedSyftAPICall)
 
     # handle_api_call should return a signed result
-    signed_result = worker.handle_api_call(signed_api_call)
+    signed_result = worker_with_proc.handle_api_call(signed_api_call)
     assert isinstance(signed_result, SignedSyftAPICall)
 
     # validation should work with the worker key

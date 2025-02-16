@@ -1,15 +1,13 @@
 # stdlib
+from collections.abc import Callable
 from typing import Any
-from typing import Callable
-from typing import List
-from typing import Union
 
 # third party
 import numpy as np
 import pandas as pd
 
 # relative
-from ..response import SyftError
+from ...types.errors import SyftException
 from ..response import SyftResponseMessage
 from ..response import SyftSuccess
 from .action_object import ActionObject
@@ -17,12 +15,12 @@ from .action_object import ActionObject
 
 def verify_result(
     func: Callable,
-    private_inputs: Union[ActionObject, List[ActionObject]],
-    private_outputs: Union[ActionObject, List[ActionObject]],
+    private_inputs: ActionObject | list[ActionObject],
+    private_outputs: ActionObject | list[ActionObject],
 ) -> SyftResponseMessage:
     """Verify a single result of Code Verification"""
     trace_assets = []
-    if not isinstance(private_inputs, List):
+    if not isinstance(private_inputs, list):
         private_inputs = [private_inputs]
 
     for asset in private_inputs:
@@ -45,7 +43,7 @@ def verify_result(
     print("Code Verification in progress.")
     traced_results = func(*trace_assets)
 
-    if isinstance(private_outputs, List):
+    if isinstance(private_outputs, list):
         target_hashes_list = [output.syft_history_hash for output in private_outputs]
         traced_hashes_list = [result.syft_history_hash for result in traced_results]
         return compare_hashes(target_hashes_list, traced_hashes_list, traced_results)
@@ -56,10 +54,10 @@ def verify_result(
 
 
 def compare_hashes(
-    target_hashes: Union[List[int], int],
-    traced_hashes: Union[List[int], int],
+    target_hashes: list[int] | int,
+    traced_hashes: list[int] | int,
     traced_results: Any,
-) -> Union[SyftSuccess, SyftError]:
+) -> SyftSuccess:
     if target_hashes == traced_hashes:
         msg = "Code Verification passed with matching hashes! Congratulations, and thank you for supporting PySyft!"
         return SyftSuccess(message=msg)
@@ -68,7 +66,7 @@ def compare_hashes(
             f"Hashes do not match! Target hashes were: {target_hashes} but Traced hashes were: {traced_results}. "
             f"Please try checking the logs."
         )
-        return SyftError(message=msg)
+        raise SyftException(public_message=msg)
 
 
 def code_verification(func: Callable) -> Callable:
@@ -83,12 +81,12 @@ def code_verification(func: Callable) -> Callable:
     - boolean:: if history hashes match
     """
 
-    def wrapper(*args: Any, **kwargs: Any) -> Union[SyftSuccess, SyftError]:
+    def wrapper(*args: Any, **kwargs: Any) -> SyftSuccess:
         trace_assets = []
         for asset in args:
             if not isinstance(asset, ActionObject):
-                raise Exception(
-                    f"ActionObject expected, instead received: {type(asset)}"
+                raise SyftException(
+                    public_message=f"ActionObject expected, instead received: {type(asset)}"
                 )
             # Manual type casting for now, to automate later
             if isinstance(asset.syft_action_data, np.ndarray):
@@ -125,6 +123,6 @@ def code_verification(func: Callable) -> Callable:
                 f"Hashes do not match! Target hashes were: {results} but Traced hashes were: {traced_results}. "
                 f"Please try checking the logs."
             )
-            return SyftError(message=msg)
+            raise SyftException(public_message=msg)
 
     return wrapper

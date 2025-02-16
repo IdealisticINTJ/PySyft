@@ -26,11 +26,11 @@ def create_asset() -> CreateAsset:
 
 @pytest.fixture
 def mock_dataset_stash(document_store) -> DatasetStash:
-    return DatasetStash(store=document_store)
+    yield DatasetStash(store=document_store)
 
 
 @pytest.fixture
-def mock_asset(worker, root_domain_client) -> Asset:
+def mock_asset(worker, root_datasite_client) -> Asset:
     # sometimes the access rights for client are overwritten
     # so we need to assing the root_client manually
     uploader = Contributor(
@@ -44,21 +44,25 @@ def mock_asset(worker, root_domain_client) -> Asset:
         data=np.array([0, 1, 2, 3, 4]),
         mock=np.array([0, 1, 1, 1, 1]),
         mock_is_real=False,
-        node_uid=worker.id,
+        server_uid=worker.id,
         uploader=uploader,
         contributors=[uploader],
+        syft_server_location=worker.id,
+        syft_client_verify_key=root_datasite_client.credentials.verify_key,
     )
-    node_transform_context = TransformContext(
-        node=worker,
-        credentials=root_domain_client.credentials.verify_key,
+    server_transform_context = TransformContext(
+        server=worker,
+        credentials=root_datasite_client.credentials.verify_key,
         obj=create_asset,
     )
-    mock_asset = create_asset.to(Asset, context=node_transform_context)
-    return mock_asset
+    mock_asset = create_asset.to(Asset, context=server_transform_context)
+    yield mock_asset
 
 
 @pytest.fixture
-def mock_dataset(root_verify_key, mock_dataset_stash, mock_asset) -> Dataset:
+def mock_dataset(
+    root_verify_key, mock_dataset_stash: DatasetStash, mock_asset
+) -> Dataset:
     uploader = Contributor(
         role=str(Roles.UPLOADER),
         name="test",
@@ -68,11 +72,11 @@ def mock_dataset(root_verify_key, mock_dataset_stash, mock_asset) -> Dataset:
         id=UID(), name="test_dataset", uploader=uploader, contributors=[uploader]
     )
     mock_dataset.asset_list.append(mock_asset)
-    result = mock_dataset_stash.partition.set(root_verify_key, mock_dataset)
+    result = mock_dataset_stash.set(root_verify_key, mock_dataset)
     mock_dataset = result.ok()
-    return mock_dataset
+    yield mock_dataset
 
 
 @pytest.fixture
 def mock_dataset_update(mock_dataset):
-    return DatasetUpdate()
+    yield DatasetUpdate()

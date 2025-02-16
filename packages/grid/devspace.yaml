@@ -6,8 +6,11 @@ pipelines:
   # This is the pipeline for the main command: `devspace dev` (or `devspace run-pipeline dev`)
   dev:
     run: |-
+      stop_dev --all
+      purge_deployments --all
       run_dependencies --all       # 1. Deploy any projects this project needs (see "dependencies")
       ensure_pull_secrets --all    # 2. Ensure pull secrets
+      build_images --all
       create_deployments --all     # 3. Deploy Helm charts and manifests specfied as "deployments"
       start_dev --all              # 4. Start dev mode "app" (see "dev" section)
   # You can run this pipeline via `devspace deploy` (or `devspace run-pipeline deploy`)
@@ -15,326 +18,276 @@ pipelines:
     run: |-
       run_dependencies --all
       ensure_pull_secrets --all
-      build_images --all -t $(git rev-parse --short=6 HEAD) -t 0.8.2-beta.40 -t dev-latest
+      build_images --all
       create_deployments --all
 
 vars:
-  DEVSPACE_ENV_FILE: "default.env"
+  DOCKER_IMAGE_BACKEND: openmined/syft-backend
+  DOCKER_IMAGE_FRONTEND: openmined/syft-frontend
+  DOCKER_IMAGE_SEAWEEDFS: openmined/syft-seaweedfs
+  DOCKER_IMAGE_RATHOLE: openmined/syft-rathole
+  DOCKER_IMAGE_ENCLAVE_ATTESTATION: openmined/syft-enclave-attestation
   CONTAINER_REGISTRY: "docker.io"
-  VERSION: "0.8.2-beta.40"
+  VERSION: "0.9.6-beta.1"
+  PLATFORM: $(uname -m | grep -q 'arm64' && echo "arm64" || echo "amd64")
 
 # This is a list of `images` that DevSpace can build for this project
 # We recommend to skip image building during development (devspace dev) as much as possible
 images:
   backend:
     image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_BACKEND}"
-    buildKit: {}
+    buildKit:
+      args: ["--platform", "linux/${PLATFORM}"]
     dockerfile: ./backend/backend.dockerfile
+    target: "backend"
     context: ../
     tags:
       - dev-latest
-      - "${VERSION}"
-  # tailscale:
-  #   image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_TAILSCALE}"
-  #   buildKit: {}
-  #   dockerfile: ./vpn/tailscale.dockerfile
-  #   context: ./vpn
-  #   tags:
-  #     - dev-latest
-  #     - "${VERSION}"
+      - dev-${DEVSPACE_TIMESTAMP}
   frontend:
     image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_FRONTEND}"
     buildKit:
-      args: ["--target", "grid-ui-production"]
+      args: ["--platform", "linux/${PLATFORM}"]
     dockerfile: ./frontend/frontend.dockerfile
-    target: "grid-ui-production"
+    target: "syft-ui-production"
     context: ./frontend
     tags:
+      - dev-${DEVSPACE_TIMESTAMP}
       - dev-latest
-      - "${VERSION}"
+  seaweedfs:
+    image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_SEAWEEDFS}"
+    buildKit:
+      args: ["--platform", "linux/${PLATFORM}"]
+    dockerfile: ./seaweedfs/seaweedfs.dockerfile
+    context: ./seaweedfs
+    tags:
+      - dev-${DEVSPACE_TIMESTAMP}
+      - dev-latest
 
 # This is a list of `deployments` that DevSpace can create for this project
 deployments:
-  grid-stack-ingress:
-    kubectl:
-      manifests:
-        - k8s/manifests/ingress.yaml
-
-  traefik-main-config:
-    kubectl:
-      manifests:
-        - "k8s/manifests/traefik-domain.yaml"
-
-  seaweedfs-config:
-    kubectl:
-      manifests:
-        - "k8s/manifests/seaweedfs.yaml"
-
-  proxy:
+  syft:
     helm:
-      upgradeArgs:
-        - --dependency-update
+      releaseName: syft-dev
       chart:
-        name: component-chart
-        repo: https://charts.devspace.sh
+        name: ./helm/syft
+      # values that need to be templated go here
       values:
-        containers:
-          - image: "${DOCKER_IMAGE_TRAEFIK}:${TRAEFIK_VERSION}"
-            volumeMounts:
-              - containerPath: /etc/traefik
-                volume:
-                  name: traefik-conf
-            env:
-              - name: SERVICE_NAME
-                value: "proxy"
-          # - image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_TAILSCALE}:${VERSION}"
-          #   securityContext:
-          #     capabilities:
-          #       add: ["NET_ADMIN", "SYS_MODULE"]
-          #     privileged: true
-          #   env:
-          #     - name: HOSTNAME
-          #       value: "${NODE_NAME}"
-          #     - name: STACK_API_KEY
-          #       value: "changeme"
-          #   volumeMounts:
-          #     - containerPath: /var/lib/tailscale
-          #       volume:
-          #         name: tailscale-data
-          #         subPath: /tailscale-data
-          #         readOnly: false
-        volumes:
-          # - name: tailscale-data
-          #   size: "100Mi"
-          - name: traefik-conf
-            configMap:
-              name: traefik-main-config
-        service:
-          name: "proxy"
-          ports:
-            - name: proxy
-              port: 80
-            # - name: api
-            #   port: 4000
-
-  backend:
-    helm:
-      upgradeArgs:
-        - --dependency-update
-      chart:
-        name: component-chart
-        repo: https://charts.devspace.sh
-      values:
-        containers:
-          - image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_BACKEND}:${VERSION}"
-            volumeMounts:
-              - containerPath: /storage
-                volume:
-                  name: credentials-data
-                  subPath: /credentials-data
-                  readOnly: false
-            env:
-              - name: MONGO_PORT
-                value: "${MONGO_PORT}"
-              - name: MONGO_HOST
-                value: "${MONGO_HOST}"
-              - name: MONGO_USERNAME
-                value: "${MONGO_USERNAME}"
-              - name: MONGO_PASSWORD
-                value: "${MONGO_PASSWORD}"
-              - name: SERVICE_NAME
-                value: "backend"
-              - name: RELEASE
-                value: "${RELEASE}"
-              - name: VERSION
-                value: "${VERSION}"
-              - name: VERSION_HASH
-                value: "${VERSION_HASH}"
-              - name: NODE_TYPE
-                value: "${NODE_TYPE}"
-              - name: NODE_NAME
-                value: "${NODE_NAME}"
-              - name: STACK_API_KEY
-                value: "changeme"
-              - name: PORT
-                value: "${HTTP_PORT}"
-              - name: IGNORE_TLS_ERRORS
-                value: "${IGNORE_TLS_ERRORS}"
-              - name: HTTP_PORT
-                value: "${HTTP_PORT}"
-              - name: HTTPS_PORT
-                value: "${HTTPS_PORT}"
-              - name: CONTAINER_HOST
-                value: "k8s"
-              - name: TRACE
-                value: "${TRACE}"
-              - name: JAEGER_HOST
-                value: "${JAEGER_HOST}"
-              - name: JAEGER_PORT
-                value: "${JAEGER_PORT}"
-              - name: DEV_MODE
-                value: "${DEV_MODE}"
-              - name: DOMAIN_CONNECTION_PORT
-                value: "${DOMAIN_CONNECTION_PORT}"
-              - name: ENABLE_OBLV
-                value: "${ENABLE_OBLV}"
-              - name: DEFAULT_ROOT_EMAIL
-                value: "${DEFAULT_ROOT_EMAIL}"
-              - name: DEFAULT_ROOT_PASSWORD
-                value: "${DEFAULT_ROOT_PASSWORD}"
-              - name: BACKEND_STORAGE_PATH
-                value: "/storage"
-        volumes:
-          - name: credentials-data
-            size: "100Mi"
-        service:
-          name: "backend"
-          ports:
-            - port: "${HTTP_PORT}"
-
-  mongo:
-    helm:
-      upgradeArgs:
-        - --dependency-update
-      chart:
-        name: component-chart
-        repo: https://charts.devspace.sh
-      values:
-        containers:
-          - image: "${MONGO_IMAGE}:${MONGO_VERSION}"
-            env:
-              - name: MONGO_INITDB_ROOT_USERNAME
-                value: "${MONGO_USERNAME}"
-              - name: MONGO_INITDB_ROOT_PASSWORD
-                value: "${MONGO_PASSWORD}"
-            volumeMounts:
-              - containerPath: /data/db
-                volume:
-                  name: mongo-data
-                  subPath: /
-                  readOnly: false
-        volumes:
-          - name: mongo-data
-            size: "5Gi"
-        service:
-          name: mongo
-          ports:
-            - port: "27017"
-
-  seaweedfs:
-    helm:
-      upgradeArgs:
-        - --dependency-update
-      chart:
-        name: component-chart
-        repo: https://charts.devspace.sh
-      values:
-        containers:
-          - image: "${DOCKER_IMAGE_SEAWEEDFS}:${SEAWEEDFS_VERSION}"
-            command:
-              - sh
-              - /etc/seaweedfs/start.sh
-            env:
-              - name: S3_VOLUME_SIZE_MB
-                value: "${S3_VOLUME_SIZE_MB}"
-              - name: S3_ROOT_USER
-                value: "${S3_ROOT_USER}"
-              - name: S3_ROOT_PWD
-                value: "${S3_ROOT_PWD}"
-              - name: S3_PORT
-                value: "${S3_PORT}"
-            volumeMounts:
-              - containerPath: /etc/seaweedfs/filer.toml
-                volume:
-                  name: seaweedfs-config
-                  subPath: /filer.toml
-                  readOnly: false
-              - containerPath: /etc/seaweedfs/start.sh
-                volume:
-                  name: seaweedfs-config
-                  subPath: /start.sh
-                  readOnly: false
-              - containerPath: /data/blob
-                volume:
-                  name: seaweedfs-data
-                  subPath: /
-                  readOnly: false
-        volumes:
-          - name: seaweedfs-data
-            size: "5Gi"
-          - name: seaweedfs-config
-            configMap:
-              name: seaweedfs-config
-        service:
-          name: seaweedfs
-          ports:
-            - port: "8888" # filer
-            - port: "8333" # S3
-
-  frontend:
-    helm:
-      upgradeArgs:
-        - --dependency-update
-      chart:
-        name: component-chart
-        repo: https://charts.devspace.sh
-      values:
-        containers:
-          - image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_FRONTEND}:${VERSION}"
-            env:
-              - name: VERSION
-                value: "${VERSION}"
-              - name: VERSION_HASH
-                value: "${VERSION_HASH}"
-              - name: NODE_TYPE
-                value: "${NODE_TYPE}"
-              - name: NEXT_PUBLIC_API_URL
-                value: "${NEXT_PUBLIC_API_URL}"
-        service:
-          name: "frontend"
-          ports:
-            - port: "80"
+        global:
+          registry: ${CONTAINER_REGISTRY}
+          version: dev-${DEVSPACE_TIMESTAMP}
+          workerVersion: dev-latest
+      # anything that does not need templating should go in helm/examples/dev/base.yaml
+      # or profile specific values files
+      valuesFiles:
+        - ./helm/examples/dev/base.yaml
 
 dev:
-  mongo:
-    imageSelector: "${MONGO_IMAGE}:${MONGO_VERSION}"
+  postgres:
+    labelSelector:
+      app.kubernetes.io/name: syft
+      app.kubernetes.io/component: postgres
     ports:
-      - port: "27017"
+      - port: "5432"
   seaweedfs:
-    imageSelector: "${DOCKER_IMAGE_SEAWEEDFS}:${SEAWEEDFS_VERSION}"
+    labelSelector:
+      app.kubernetes.io/name: syft
+      app.kubernetes.io/component: seaweedfs
     ports:
       - port: "9333" # admin
       - port: "8888" # filer
       - port: "8333" # S3
+      - port: "4001" # mount azure
+      - port: "5432" # mount postgres
   backend:
-    imageSelector: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_BACKEND}"
-    env:
-      - name: DEV_MODE
-        value: "True"
-    logs: {}
-    sync:
-      - path: ./backend/grid:/app/grid
-      - path: ../syft:/app/syft
+    labelSelector:
+      app.kubernetes.io/name: syft
+      app.kubernetes.io/component: backend
+    ports:
+      - port: "5678" # debugpy
+    containers:
+      backend-container:
+        env:
+          - name: RELEASE
+            value: development
+          - name: DEV_MODE
+            value: "True"
+          - name: DEBUGGER_ENABLED
+            value: "True"
+        sync:
+          - path: ./backend/grid:/root/app/grid
+          - path: ../syft:/root/app/syft
+        ssh:
+          localPort: 3480
 
 profiles:
-  - name: gateway
+  - name: datasite-low
+    description: "Deploy a low-side datasite"
     patches:
-      - op: remove
-        path: deployments.seaweedfs
-      - op: remove
-        path: deployments.seaweedfs-config
+      - op: add
+        path: deployments.syft.helm.values.server
+        value:
+          side: low
 
-commands:
-  deploy:
-    command: |-
-      devspace use context k3d-syft-dev
-      devspace use namespace syft
-      devspace deploy --var CONTAINER_REGISTRY=k3d-registry.localhost:12345
-  dev:
-    command: |-
-      devspace use context k3d-syft-dev
-      devspace use namespace syft
-      devspace dev --var CONTAINER_REGISTRY=k3d-registry.localhost:12345
-  contexts:
-    command: |-
-      kubectl config get-contexts
+  - name: tracing
+    description: "Enable Tracing"
+    patches:
+      - op: add
+        path: deployments.syft.helm.values.server
+        value:
+          tracing:
+            enabled: true
+            otlpEndpoint: "http://host.k3d.internal:4317"
+            otelProtocol: "grpc"
+
+  - name: bigquery-scenario-tests
+    description: "Deploy a datasite for bigquery scenario testing"
+    patches:
+      - op: add
+        path: deployments.syft.helm.valuesFiles
+        value: ./helm/examples/dev/bigquery.scenario.yaml
+
+  - name: migrated-datasite
+    description: "Deploy a migrated datasite"
+    patches:
+      - op: add
+        path: deployments.syft.helm.valuesFiles
+        value: ./helm/examples/dev/migration.yaml
+
+  - name: datasite-tunnel
+    description: "Deploy a datasite with tunneling enabled"
+    patches:
+      # enable rathole image
+      - op: add
+        path: images
+        value:
+          rathole:
+            image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_RATHOLE}"
+            buildKit:
+              args: ["--platform", "linux/${PLATFORM}"]
+            dockerfile: ./rathole/rathole.dockerfile
+            context: ./rathole
+            tags:
+              - dev-${DEVSPACE_TIMESTAMP}
+              - dev-latest
+      # use rathole client-specific chart values
+      - op: add
+        path: deployments.syft.helm.valuesFiles
+        value: ./helm/examples/dev/datasite.tunnel.yaml
+
+  - name: gateway
+    description: "Deploy a Gateway Server with tunnel enabled"
+    patches:
+      # enable rathole image
+      - op: add
+        path: images
+        value:
+          rathole:
+            image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_RATHOLE}"
+            buildKit:
+              args: ["--platform", "linux/${PLATFORM}"]
+            dockerfile: ./rathole/rathole.dockerfile
+            context: ./rathole
+            tags:
+              - dev-${DEVSPACE_TIMESTAMP}
+              - dev-latest
+      # enable rathole `devspace dev` config
+      - op: add
+        path: dev
+        value:
+          rathole:
+            labelSelector:
+              app.kubernetes.io/name: syft
+              app.kubernetes.io/component: rathole
+            ports:
+              - port: "2333"
+      # use gateway-specific chart values
+      - op: add
+        path: deployments.syft.helm.valuesFiles
+        value: ./helm/examples/dev/gateway.yaml
+      # remove unused images
+      - op: remove
+        path: images.seaweedfs
+      - op: remove
+        path: dev.seaweedfs
+      # Port Re-Mapping
+      - op: replace
+        path: dev.postgres.ports[0].port
+        value: 5433:5432
+      - op: replace
+        path: dev.backend.ports[0].port
+        value: 5679:5678
+      - op: replace
+        path: dev.backend.containers.backend-container.ssh.localPort
+        value: 3481
+      - op: replace
+        path: dev.rtunnel.ports[0].port
+        value: 2334:2333
+
+  - name: gcp
+    description: "Deploy a high-side datasite on GCP"
+    patches:
+      - op: replace
+        path: deployments.syft.helm.valuesFiles
+        value:
+          - ./helm/examples/gcp/gcp.high.yaml
+
+  - name: gcp-low
+    description: "Deploy a low-side datasite on GCP"
+    patches:
+      - op: replace
+        path: deployments.syft.helm.valuesFiles
+        value:
+          - ./helm/examples/gcp/gcp.low.yaml
+
+  - name: azure
+    description: "Deploy a high-side datasite on AKS"
+    patches:
+      - op: replace
+        path: deployments.syft.helm.valuesFiles
+        value:
+          - ./helm/examples/azure/azure.high.yaml
+
+  - name: enclave
+    description: "Deploy an enclave server"
+    patches:
+      # enable image build for enclave-attestation
+      - op: add
+        path: images
+        value:
+          enclave-attestation:
+            image: "${CONTAINER_REGISTRY}/${DOCKER_IMAGE_ENCLAVE_ATTESTATION}"
+            buildKit:
+              args: ["--platform", "linux/amd64"]
+            dockerfile: ./enclave/attestation/attestation.dockerfile
+            context: ./enclave/attestation
+            tags:
+              - dev-latest
+              - dev-${DEVSPACE_TIMESTAMP}
+      - op: add
+        path: dev.backend.containers
+        value:
+          enclave-attestation:
+            sync:
+              - path: ./enclave/attestation/server:/app/server
+      # use gateway-specific chart values
+      - op: add
+        path: deployments.syft.helm.valuesFiles
+        value: ./helm/examples/dev/enclave.yaml
+      # Port Re-Mapping
+      - op: replace
+        path: dev.postgres.ports[0].port
+        value: 5434:5432
+      - op: replace
+        path: dev.backend.ports[0].port
+        value: 5680:5678
+      - op: replace
+        path: dev.backend.containers.backend-container.ssh.localPort
+        value: 3482
+      - op: replace
+        path: dev.seaweedfs.ports
+        value:
+          - port: "9334:9333" # admin
+          - port: "8889:8888" # filer
+          - port: "8334:8333" # S3
+          - port: "4002:4001" # mount api

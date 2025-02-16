@@ -1,5 +1,6 @@
 # stdlib
-from typing import Optional
+from typing import Any
+from typing import cast
 
 # third party
 from IPython.display import display
@@ -7,10 +8,11 @@ from rich.prompt import Confirm
 from typing_extensions import Self
 
 # relative
-from ..abstract_node import AbstractNode
-from ..abstract_node import NodeSideType
-from ..node.credentials import SyftCredentials
+from ..abstract_server import AbstractServer
+from ..abstract_server import ServerSideType
+from ..abstract_server import ServerType
 from ..serde.serializable import serializable
+from ..server.credentials import SyftCredentials
 from ..types.base import SyftBaseModel
 from ..types.syft_object import Context
 from .user.user_roles import ServiceRole
@@ -19,18 +21,18 @@ from .user.user_roles import ServiceRole
 class WarningContext(
     Context,
 ):
-    node: Optional[AbstractNode]
-    credentials: Optional[SyftCredentials]
+    server: AbstractServer | None = None
+    credentials: SyftCredentials | None = None
     role: ServiceRole
 
 
-@serializable()
+@serializable(canonical_name="APIEndpointWarning", version=1)
 class APIEndpointWarning(SyftBaseModel):
     confirmation: bool = False
-    message: Optional[str] = None
+    message: str | None = None
     enabled: bool = True
 
-    def __eq__(self, other) -> bool:
+    def __eq__(self, other: Any) -> bool:
         if isinstance(other, APIEndpointWarning):
             return self.message == other.message and self._bool == other._bool
         return self._bool == other
@@ -51,10 +53,10 @@ class APIEndpointWarning(SyftBaseModel):
             + f"<strong>SyftWarning</strong>: {self.message}</div><br />"
         )
 
-    def message_from(self, context: Optional[WarningContext]) -> Self:
+    def message_from(self, context: WarningContext | None) -> Self:
         raise NotImplementedError
 
-    def show(self):
+    def show(self) -> bool:
         if not self.enabled or not self.message:
             return True
         display(self)
@@ -66,91 +68,94 @@ class APIEndpointWarning(SyftBaseModel):
         return True
 
 
-@serializable()
+@serializable(canonical_name="CRUDWarning", version=1)
 class CRUDWarning(APIEndpointWarning):
-    def message_from(self, context: Optional[WarningContext] = None):
+    def message_from(self, context: WarningContext | None = None) -> Self:
         message = None
         confirmation = self.confirmation
         if context is not None:
-            node = context.node
-            node_side_type = node.node_side_type
-            node_type = node.node_type
-            _msg = (
-                "which could host datasets with private information."
-                if node_side_type.value == NodeSideType.HIGH_SIDE.value
-                else "which only hosts mock or synthetic data."
-            )
-            message = (
-                "You're performing an operation on "
-                f"{node_side_type.value} side {node_type.value}, {_msg}"
-            )
-            confirmation = node_side_type.value == NodeSideType.HIGH_SIDE.value
-            message = message
+            server = context.server
+            if server is not None:
+                server_side_type = cast(ServerSideType, server.server_side_type)
+                server_type = server.server_type
+
+                _msg = (
+                    "which could host datasets with private information."
+                    if server_side_type.value == ServerSideType.HIGH_SIDE.value
+                    else "which only hosts mock or synthetic data."
+                )
+                if server_type is not None:
+                    message = (
+                        "You're performing an operation on "
+                        f"{server_side_type.value} side {server_type.value}, {_msg}"
+                    )
+                confirmation = server_side_type.value == ServerSideType.HIGH_SIDE.value
 
         return CRUDWarning(confirmation=confirmation, message=message)
 
 
-@serializable()
+@serializable(canonical_name="CRUDReminder", version=1)
 class CRUDReminder(CRUDWarning):
     confirmation: bool = False
 
-    def message_from(self, context: Optional[WarningContext] = None):
+    def message_from(self, context: WarningContext | None = None) -> Self:
         message = None
         confirmation = self.confirmation
         if context is not None:
-            node = context.node
-            node_side_type = node.node_side_type
-            node_type = node.node_type
-            _msg = (
-                "which could host datasets with private information."
-                if node_side_type.value == NodeSideType.HIGH_SIDE.value
-                else "which only hosts mock or synthetic data."
-            )
-            message = (
-                "You're performing an operation on "
-                f"{node_side_type.value} side {node_type.value}, {_msg}"
-            )
-            message = message
+            server = context.server
+            if server is not None:
+                server_side_type = cast(ServerSideType, server.server_side_type)
+                server_type = server.server_type
+
+                _msg = (
+                    "which could host datasets with private information."
+                    if server_side_type.value == ServerSideType.HIGH_SIDE.value
+                    else "which only hosts mock or synthetic data."
+                )
+                if server_type is not None:
+                    message = (
+                        "You're performing an operation on "
+                        f"{server_side_type.value} side {server_type.value}, {_msg}"
+                    )
 
         return CRUDReminder(confirmation=confirmation, message=message)
 
 
-@serializable()
+@serializable(canonical_name="LowSideCRUDWarning", version=1)
 class LowSideCRUDWarning(APIEndpointWarning):
-    def message_from(self, context: Optional[WarningContext] = None):
+    def message_from(self, context: WarningContext | None = None) -> Self:
         confirmation = self.confirmation
         message = None
         if context is not None:
-            node = context.node
-            node_side_type = node.node_side_type
-            node_type = node.node_type
-            if node_side_type.value == NodeSideType.LOW_SIDE.value:
-                message = (
-                    "You're performing an operation on "
-                    f"{node_side_type.value} side {node_type.value} "
-                    "which only hosts mock or synthetic data."
-                )
-
-            message = message
+            server = context.server
+            if server is not None:
+                server_side_type = cast(ServerSideType, server.server_side_type)
+                server_type = cast(ServerType, server.server_type)
+                if server_side_type.value == ServerSideType.LOW_SIDE.value:
+                    message = (
+                        "You're performing an operation on "
+                        f"{server_side_type.value} side {server_type.value} "
+                        "which only hosts mock or synthetic data."
+                    )
 
         return LowSideCRUDWarning(confirmation=confirmation, message=message)
 
 
-@serializable()
+@serializable(canonical_name="HighSideCRUDWarning", version=1)
 class HighSideCRUDWarning(APIEndpointWarning):
-    def message_from(self, context: Optional[WarningContext] = None):
+    def message_from(self, context: WarningContext | None = None) -> Self:
         confirmation = self.confirmation
         message = None
         if context is not None:
-            node = context.node
-            node_side_type = node.node_side_type
-            node_type = node.node_type
-            if node_side_type.value == NodeSideType.HIGH_SIDE.value:
-                message = (
-                    "You're performing an operation on "
-                    f"{node_side_type.value} side {node_type.value} "
-                    "which could host datasets with private information."
-                )
-                message = message
+            server = context.server
+            if server is not None:
+                server_side_type = cast(ServerSideType, server.server_side_type)
+                server_type = cast(ServerType, server.server_type)
+                if server_side_type.value == ServerSideType.HIGH_SIDE.value:
+                    message = (
+                        "You're performing an operation on "
+                        f"{server_side_type.value} side {server_type.value} "
+                        "which could host datasets with private information."
+                    )
 
         return HighSideCRUDWarning(confirmation=confirmation, message=message)

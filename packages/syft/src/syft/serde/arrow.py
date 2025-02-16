@@ -1,5 +1,4 @@
 # stdlib
-from typing import Union
 from typing import cast
 
 # third party
@@ -14,20 +13,24 @@ from .serialize import _serialize
 
 
 def arrow_serialize(obj: np.ndarray) -> bytes:
-    original_dtype = obj.dtype
-    apache_arrow = pa.Tensor.from_numpy(obj=obj)
-    sink = pa.BufferOutputStream()
-    pa.ipc.write_tensor(apache_arrow, sink)
-    buffer = sink.getvalue()
-    if flags.APACHE_ARROW_COMPRESSION is ApacheArrowCompression.NONE:
-        numpy_bytes = buffer.to_pybytes()
-    else:
-        numpy_bytes = pa.compress(
-            buffer, asbytes=True, codec=flags.APACHE_ARROW_COMPRESSION.value
-        )
-    dtype = original_dtype.name
+    # inner function to make sure variables go out of scope after this
+    def inner(obj: np.ndarray) -> tuple:
+        original_dtype = obj.dtype
+        apache_arrow = pa.Tensor.from_numpy(obj=obj)
+        sink = pa.BufferOutputStream()
+        pa.ipc.write_tensor(apache_arrow, sink)
+        buffer = sink.getvalue()
+        if flags.APACHE_ARROW_COMPRESSION is ApacheArrowCompression.NONE:
+            numpy_bytes = buffer.to_pybytes()
+        else:
+            numpy_bytes = pa.compress(
+                buffer, asbytes=True, codec=flags.APACHE_ARROW_COMPRESSION.value
+            )
+        dtype = original_dtype.name
+        return (numpy_bytes, buffer.size, dtype)
 
-    return cast(bytes, _serialize((numpy_bytes, buffer.size, dtype), to_bytes=True))
+    m = inner(obj)
+    return cast(bytes, _serialize(m, to_bytes=True))
 
 
 def arrow_deserialize(
@@ -76,7 +79,7 @@ def numpyutf8toarray(input_index: np.ndarray) -> np.ndarray:
     return np.array(output_list).reshape(shape)
 
 
-def arraytonumpyutf8(string_list: Union[str, np.ndarray]) -> bytes:
+def arraytonumpyutf8(string_list: str | np.ndarray) -> bytes:
     """Encodes string Numpyarray  to utf-8 encoded numpy array.
 
     Args:

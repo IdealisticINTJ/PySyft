@@ -1,14 +1,18 @@
-FROM node:18-alpine as base
+FROM cgr.dev/chainguard/wolfi-base as base
 
-ARG VITE_PUBLIC_API_BASE_URL
-ENV VITE_PUBLIC_API_BASE_URL ${VITE_PUBLIC_API_BASE_URL}
-ENV NODE_TYPE domain
+ARG BACKEND_API_BASE_URL="/api/v2/"
+ENV BACKEND_API_BASE_URL ${BACKEND_API_BASE_URL}
 
-RUN apk update && apk upgrade --available
+RUN apk update && \
+  apk upgrade && \
+  apk add --no-cache nodejs-20 pnpm corepack
+
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
 
 WORKDIR /app
 
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable
 
 COPY .npmrc ./
 COPY package.json ./
@@ -16,18 +20,18 @@ COPY pnpm-lock.yaml ./
 
 FROM base AS dependencies
 
-RUN pnpm i --frozen-lockfile
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 
-FROM dependencies as grid-ui-tests
+FROM dependencies as syft-ui-tests
 COPY vite.config.ts ./
 COPY ./tests ./tests
 COPY ./src/ ./src
 
 CMD pnpm test:unit
 
-FROM dependencies as grid-ui-development
+FROM dependencies as syft-ui-development
 
-ENV NODE_ENV=development
+ENV SERVER_ENV=development
 
 COPY . .
 CMD pnpm dev
@@ -37,9 +41,9 @@ FROM dependencies AS builder
 COPY . .
 RUN pnpm build
 
-FROM base AS grid-ui-production
+FROM base AS syft-ui-production
 
-ENV NODE_ENV=production
+ENV SERVER_ENV=production
 
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY --from=builder /app ./

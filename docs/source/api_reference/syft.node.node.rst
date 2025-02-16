@@ -1,7 +1,7 @@
-syft.node.node
+syft.server.server
 ==============
 
-.. automodule:: syft.node.node
+.. automodule:: syft.server.server
 
    
    
@@ -14,12 +14,11 @@ syft.node.node
    .. autosummary::
    
       create_admin_new
-      create_oblv_key_pair
       create_worker_metadata
       get_default_root_email
       get_default_root_password
       get_env
-      get_node_uid_env
+      get_server_uid_env
       get_private_key_env
       gipc_decoder
       gipc_encoder
@@ -36,7 +35,7 @@ syft.node.node
 
    .. autosummary::
    
-      Node
+      Server
    
    
 

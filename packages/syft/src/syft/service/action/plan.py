@@ -1,9 +1,7 @@
 # stdlib
+from collections.abc import Callable
 import inspect
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Optional
+from typing import Any
 
 # relative
 from ... import ActionObject
@@ -13,19 +11,26 @@ from ...serde.recursive import recursive_serde_register
 from ...types.syft_object import SYFT_OBJECT_VERSION_1
 from ...types.syft_object import SyftObject
 from .action_object import Action
-from .action_object import TraceResult
+from .action_object import TraceResultRegistry
 
 
 class Plan(SyftObject):
     __canonical_name__ = "Plan"
     __version__ = SYFT_OBJECT_VERSION_1
-    syft_passthrough_attrs = ["inputs", "outputs", "code", "actions", "client"]
 
-    inputs: Dict[str, ActionObject]
-    outputs: List[ActionObject]
-    actions: List[Action]
+    syft_passthrough_attrs: list[str] = [
+        "inputs",
+        "outputs",
+        "code",
+        "actions",
+        "client",
+    ]
+
+    inputs: dict[str, ActionObject]
+    outputs: list[ActionObject]
+    actions: list[Action]
     code: str
-    client: Optional[SyftClient] = None
+    client: SyftClient | None = None
 
     def __repr__(self) -> str:
         obj_str = "Plan"
@@ -45,43 +50,50 @@ class Plan(SyftObject):
 
         return f"{obj_str}\n{inp_str}\n{act_str}\n{out_str}\n\n{plan_str}"
 
-    def remap_actions_to_inputs(self, **new_inputs):
+    def remap_actions_to_inputs(self, **new_inputs: Any) -> None:
         pass
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: Any, **kwargs: Any) -> ActionObject | list[ActionObject]:
         if len(self.outputs) == 1:
             return self.outputs[0]
         else:
             return self.outputs
 
 
-def planify(func):
-    TraceResult.reset()
+def planify(func: Callable) -> ActionObject:
+    TraceResultRegistry.reset_result_for_thread()
+    # TraceResult.reset()
     ActionObject.add_trace_hook()
-    TraceResult.is_tracing = True
     worker = Worker.named(name="plan_building", reset=True, processes=0)
     client = worker.root_client
-    TraceResult._client = client
-    plan_kwargs = build_plan_inputs(func, client)
-    outputs = func(**plan_kwargs)
-    if not (isinstance(outputs, list) or isinstance(outputs, tuple)):
-        outputs = [outputs]
-    ActionObject.remove_trace_hook()
-    actions = TraceResult.result
-    TraceResult.reset()
-    code = inspect.getsource(func)
-    for a in actions:
-        if a.create_object is not None:
-            # warmup cache
-            a.create_object.syft_action_data  # noqa: B018
-    plan = Plan(inputs=plan_kwargs, actions=actions, outputs=outputs, code=code)
-    TraceResult.is_tracing = False
-    return ActionObject.from_obj(plan)
+    if client is None:
+        raise ValueError("Not able to get client for plan building")
+    # if client.settings is not None:
+    #     client.settings.enable_eager_execution(enable=True) # NOTE: Disabled until we bring back eager execution
+    TraceResultRegistry.set_trace_result_for_current_thread(client=client)
+    try:
+        # TraceResult._client = client
+        plan_kwargs = build_plan_inputs(func, client)
+        outputs = func(**plan_kwargs)
+        if not (isinstance(outputs, list) or isinstance(outputs, tuple)):
+            outputs = [outputs]
+        ActionObject.remove_trace_hook()
+        actions = TraceResultRegistry.get_trace_result_for_thread().result  # type: ignore
+        TraceResultRegistry.reset_result_for_thread()
+        code = inspect.getsource(func)
+        for a in actions:
+            if a.create_object is not None:
+                # warmup cache
+                a.create_object.syft_action_data  # noqa: B018
+        plan = Plan(inputs=plan_kwargs, actions=actions, outputs=outputs, code=code)
+        return ActionObject.from_obj(plan)
+    finally:
+        TraceResultRegistry.reset_result_for_thread()
 
 
 def build_plan_inputs(
     forward_func: Callable, client: SyftClient
-) -> Dict[str, ActionObject]:
+) -> dict[str, ActionObject]:
     signature = inspect.signature(forward_func)
     res = {}
     for k, v in signature.parameters.items():
